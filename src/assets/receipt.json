@@ -1,0 +1,99 @@
+{
+  "printer_name": ["EPSON TM-T81 Receipt"],
+  "item_length": 35,
+  "thankYou": "Thank you for your purchase!",
+  "data": [
+    {
+      "type": "logo",
+      "data": {
+        "url": "https://dummyimage.com/576x160/ffffff/000.png&text=YOUR+LOGO"
+      }
+    },
+    {
+      "type": "header",
+      "data": {
+        "top_title": "Aquation Restaurant",
+        "sub_titles": [
+          "Koh Pich Street, Diamond Island",
+          "Phnom Penh 0967452713",
+          "Takeaway"
+        ],
+        "address": ["Koh Pich Street, Diamond Island, Phnom Penh"],
+        "time": "12:05"
+      }
+    },
+    {
+      "type": "item",
+      "data": {
+        "itemdata": [
+          {
+            "item_amount": "160.00",
+            "item_name": "Classic Veg Burger with Extra Cheese Slice",
+            "item_subLine": "",
+            "quantity": "2",
+            "price": "0.00"
+          },
+          {
+            "item_amount": "30.00",
+            "item_name": "Masala Tea",
+            "item_subLine": "",
+            "quantity": "1",
+            "price": "0.00"
+          }
+        ]
+      }
+    },
+    {
+      "type": "bigsummary",
+      "data": {
+        "bigsummary": [
+          { "key": "Subtotal",    "value": "190.00", "fontwidth": "1" },
+          { "key": "CGST (2.5%)", "value": "4.75",   "fontwidth": "1" },
+          { "key": "SGST (2.5%)", "value": "4.75",   "fontwidth": "1" },
+          { "key": "Grand Total", "value": "199.50", "fontwidth": "1" }
+        ]
+      }
+    },
+    {
+      "type": "summary",
+      "data": {
+        "summary": [
+          { "key": "Paid Amount", "value": "200.00" },
+          { "key": "Change",      "value": "0.50" }
+        ]
+      }
+    },
+    {
+      "type": "footer",
+      "data": {
+        "align": "left",
+        "footer_text": ["Invoice: AQR-T-000001", "Customer: Walk In"]
+      }
+    },
+    {
+      "type": "footer",
+      "data": {
+        "align": "center",
+        "footer_text": ["Order# 1024  •  12:05 PM"]
+      }
+    },
+    {
+      "type": "footer",
+      "data": {
+        "align": "right",
+        "footer_text": ["Powered by RNPrinter"]
+      }
+    },
+    {
+      "type": "setting",
+      "data": {
+        "print_type": "",
+        "item_length": 35,
+        "print_logo": true,
+        "thankyou_note": "Thank you for your purchase!",
+        "thankyou_note2": "",
+        "printer_type": "POS"
+      }
+    }
+  ]
+}
