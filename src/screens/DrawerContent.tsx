@@ -19,7 +19,9 @@ import {
   DrawerContentScrollView,
   type DrawerContentComponentProps,
 } from '@react-navigation/drawer';
-import { BLEPrinter } from 'react-native-thermal-receipt-printer-image-qr';
+
+// ✅ CHANGED: use RN Bluetooth Classic for listing paired printers (Classic MAC)
+import RNBluetoothClassic from 'react-native-bluetooth-classic';
 
 import { BLEPrinterService } from '../transports/blePrinter';
 import { NetPrinterService } from '../transports/netPrinter';
@@ -85,9 +87,10 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
         Alert.alert('Permission required', 'Enable Bluetooth & Location permissions.');
         return;
       }
-      await BLEPrinter.init();
-      const list = await BLEPrinter.getDeviceList();
-      await appendLog(`[BLE] getDeviceList() -> count=${list?.length || 0}`);
+
+      // ✅ CHANGED: list **Classic** bonded devices (with Classic `address`)
+      const list = await RNBluetoothClassic.getBondedDevices();
+      await appendLog(`[BLE] RNBC.getBondedDevices() -> count=${list?.length || 0}`);
       if (!list?.length) {
         Alert.alert('No devices', 'Pair your printer in Android Bluetooth settings first.');
         return;
@@ -102,9 +105,10 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
     }
   };
 
+  // ✅ CHANGED: use Classic `address` instead of BLE `inner_mac_address`
   const selectDevice = (d: any) => {
-    setBleDevice({ name: d.device_name, mac: d.inner_mac_address });
-    appendLog(`[BLE] selected device name="${d.device_name}" mac=${d.inner_mac_address}`);
+    setBleDevice({ name: d.name || d.device_name || 'Printer', mac: d.address });
+    appendLog(`[BLE] selected device name="${d.name || d.device_name}" mac=${d.address}`);
     setPickerVisible(false);
   };
 
@@ -255,7 +259,6 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
         if (!(await ensureBtPerms())) return;
         try {
           await appendLog('[BOOT] try auto BLE reconnect');
-          await BLEPrinter.init();
           await ble.init();
           await ble.connect(prefs.btAddress);
           setBleConnected(true);
@@ -306,7 +309,6 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
         if (!(await ensureBtPerms())) return;
         try {
           await appendLog('[APPSTATE] try BLE reconnect');
-          await BLEPrinter.init();
           await ble.init();
           await ble.connect(prefs.btAddress);
           setBleConnected(true);
@@ -467,11 +469,13 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
             <Text style={[styles.h1, { marginBottom: 8 }]}>Select Bluetooth Device</Text>
             <FlatList
               data={bleList}
-              keyExtractor={(item, idx) => `${item?.inner_mac_address || idx}`}
+              // ✅ CHANGED: key uses Classic address
+              keyExtractor={(item, idx) => `${item?.address || idx}`}
               renderItem={({ item }) => (
                 <TouchableOpacity style={styles.deviceRow} onPress={() => selectDevice(item)}>
-                  <Text style={{ fontWeight: '600' }}>{item.device_name}</Text>
-                  <Text style={{ opacity: 0.6 }}>{item.inner_mac_address}</Text>
+                  <Text style={{ fontWeight: '600' }}>{item.name || item.device_name}</Text>
+                  {/* ✅ CHANGED: show Classic `address` */}
+                  <Text style={{ opacity: 0.6 }}>{item.address}</Text>
                 </TouchableOpacity>
               )}
               ListEmptyComponent={<Text>No devices found</Text>}

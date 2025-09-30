@@ -1,14 +1,30 @@
 // src/transports/blePrinter.ts
 // @ts-nocheck
+//
+// BLE-first hybrid transport:
+// - Use BLEPrinter for init/connect/printText/printImageBase64 (so logos print)
+// - Try cut via BLE raw; if the printer ignores it, fall back to a short
+//   Classic RFCOMM (SPP) send using react-native-bluetooth-classic just for the cut.
+//
+// Why: many printers silently ignore cutter opcodes over BLE, but accept them
+// over RFCOMM. This hybrid approach preserves your logo printing and restores
+// auto-cut on the same MAC.
+
 import { BLEPrinter } from 'react-native-thermal-receipt-printer-image-qr';
+import RNBluetoothClassic from 'react-native-bluetooth-classic';
 import { Buffer } from 'buffer';
 import type { PrinterTransport } from './types';
 
-const hasFn = (obj: any, key: string) => obj && typeof obj[key] === 'function';
+const hasFn = (o: any, k: string) => o && typeof o[k] === 'function';
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 export class BLEPrinterService implements PrinterTransport {
+  private mac: string | null = null;
+
   async init() {
     if (hasFn(BLEPrinter, 'init')) await BLEPrinter.init();
+    // best-effort ensure BT is on (no-op if fails)
+    try { await RNBluetoothClassic.isBluetoothEnabled?.(); } catch {}
   }
 
   async connect(mac: string) {
@@ -18,18 +34,17 @@ export class BLEPrinterService implements PrinterTransport {
       throw new Error('BLE connectPrinter() not available in this library build');
     }
     await BLEPrinter.connectPrinter(mac);
+    this.mac = mac;
     console.log(`[BLE] Successfully connected to ${mac}`);
   }
 
   async disconnect() {
     if (hasFn(BLEPrinter, 'closeConn')) {
-      try {
-        await BLEPrinter.closeConn();
-        console.log('[BLE] Disconnected from printer.');
-      } catch (e) {
-        console.warn('[BLE] Error during disconnect (may be already closed):', e);
-      }
+      try { await BLEPrinter.closeConn(); } catch (e) { console.warn('[BLE] closeConn err:', e); }
     }
+    // Also best-effort close RFCOMM if it happens to be open
+    try { if (this.mac) await RNBluetoothClassic.disconnectFromDevice?.(this.mac); } catch {}
+    console.log('[BLE] Disconnected from printer.');
   }
 
   async printText(text: string, opts?: any) {
@@ -45,118 +60,107 @@ export class BLEPrinterService implements PrinterTransport {
       console.error('[BLE ERROR] printImageBase64() not available.');
       throw new Error('BLE printImageBase64() not available');
     }
-    await BLEPrinter.printImageBase64(b64, opts || {});
+    // Many firmwares require width to be divisible by 8
+    const w = Math.max(8, (opts?.imageWidth ?? 0) & ~7);
+    await BLEPrinter.printImageBase64(b64, { imageWidth: w });
   }
 
-  /**
-   * Try to send raw bytes.
-   * Returns true if sent, false if not supported by this library build.
-   * (Slight tweak: try base64 first because many builds accept only base64.)
-   */
-  private async tryPrintRaw(bytes: number[]): Promise<boolean> {
+  /** ------- Raw helpers ------- */
+
+  // Try to send raw over BLE (if this build supports printRawData)
+  private async tryBleRaw(bytes: number[]): Promise<boolean> {
     const anyPrinter: any = BLEPrinter;
-    console.log(
-      '[BLE tryPrintRaw] Attempting to send raw bytes:',
-      bytes.map(b => '0x' + b.toString(16)).join(' ')
-    );
+    if (!hasFn(anyPrinter, 'printRawData')) return false;
 
-    if (!hasFn(anyPrinter, 'printRawData')) {
-      console.warn('[BLE tryPrintRaw] BLEPrinter.printRawData is NOT available in this library build.');
-      return false;
-    }
-
-    // Prefer base64 first (most builds expect this)
+    // prefer base64 first
     try {
       const b64 = Buffer.from(Uint8Array.from(bytes)).toString('base64');
       await anyPrinter.printRawData(b64);
-      console.log('[BLE tryPrintRaw] Sent raw bytes as base64 successfully.');
       return true;
-    } catch (eBase64) {
-      console.warn('[BLE tryPrintRaw] Sending raw bytes as base64 failed:', eBase64);
-      // Fallback: some forks accept number[]
-      try {
-        await anyPrinter.printRawData(bytes);
-        console.log('[BLE tryPrintRaw] Sent raw bytes as number[] successfully.');
-        return true;
-      } catch (eArr) {
-        console.warn('[BLE tryPrintRaw] Sending raw bytes as number[] failed:', eArr);
-        return false;
-      }
+    } catch {
+      // fallback number[]
+      try { await anyPrinter.printRawData(bytes); return true; } catch { return false; }
     }
   }
 
-  /** Public raw helper that won’t throw if unsupported. */
+  // One-shot RFCOMM write: connect -> write -> small settle -> disconnect
+  private async sendClassicOnce(bytes: number[]): Promise<boolean> {
+    if (!this.mac) return false;
+    let ok = false;
+    try {
+      // Connect secure first, then insecure fallback
+      let conn = null;
+      try {
+        conn = await RNBluetoothClassic.connectToDevice(this.mac, { CONNECTOR_TYPE: 'rfcomm', secure: true });
+      } catch {}
+      if (!conn) {
+        conn = await RNBluetoothClassic.connectToDevice(this.mac, { CONNECTOR_TYPE: 'rfcomm', secure: false });
+      }
+      if (!conn) throw new Error('RFCOMM connect failed');
+
+      const bin = Buffer.from(Uint8Array.from(bytes));
+      await RNBluetoothClassic.writeToDevice(this.mac, bin); // no encoding for Buffer
+      ok = true;
+      // tiny settle so the device acts on the command before we drop
+      await sleep(60);
+    } catch (e) {
+      console.warn('[BLE->RFCOMM] sendClassicOnce error:', e);
+    } finally {
+      try { await RNBluetoothClassic.disconnectFromDevice?.(this.mac); } catch {}
+    }
+    return ok;
+  }
+
+  /** Public raw that tries BLE; no-throw if unsupported */
   async printRaw(bytes: number[]) {
-    await this.tryPrintRaw(bytes);
+    await this.tryBleRaw(bytes);
   }
 
   /**
-   * Cut paper (default partial) with safe fallbacks.
-   * If raw bytes aren’t supported by your BLE build AND no cutPaper(),
-   * this will just feed and return (no crash).
+   * Cut paper (default 'partial'). Strategy:
+   *  1) Feed a few lines via BLE (ensures logo raster finishes & paper clears the platen)
+   *  2) Try BLE raw cutter opcodes (some builds/printers ignore these)
+   *  3) If no cut, try the SAME opcodes over a short RFCOMM session (usually works)
    */
   async cut(mode: 'full' | 'partial' = 'partial') {
-    console.log(`[BLE Cut] Attempting to cut paper (mode: ${mode})...`);
+    console.log('[BLE Cut] start', { mode });
 
-    // 1) Feed ~3 lines. Prefer ESC d n via raw; fall back to text.
-    console.log('[BLE Cut] Step 1: Attempting to feed paper with ESC d 3...');
-    const fed = await this.tryPrintRaw([0x1B, 0x64, 0x03]); // ESC d 3 (feed n lines)
-    if (!fed && hasFn(BLEPrinter, 'printText')) {
-      try {
-        console.log('[BLE Cut] Raw feed failed, falling back to printText for feeding...');
-        await BLEPrinter.printText('\n\n\n', {});
-      } catch (e) {
-        console.warn('[BLE Cut] printText feed fallback failed:', e);
-      }
-    } else if (fed) {
-      console.log('[BLE Cut] Paper fed successfully with raw command.');
+    // 1) Feed (use ESC d 5 if possible; fallback newlines)
+    const fed = await this.tryBleRaw([0x1B, 0x64, 0x05]); // ESC d 5
+    if (!fed) {
+      try { await BLEPrinter.printText('\n\n\n\n\n', {}); } catch {}
     }
+    await sleep(40);
 
-    // 2) Library-native cutter if available.
-    console.log('[BLE Cut] Step 2: Checking for native cutPaper()...');
-    if (hasFn(BLEPrinter, 'cutPaper')) {
-      try {
-        console.log('[BLE Cut] native cutPaper() FOUND. Attempting to use it...');
-        await BLEPrinter.cutPaper();
-        console.log('[BLE Cut] native cutPaper() successful. Returning.');
-        return;
-      } catch (e) {
-        console.warn('[BLE Cut] native cutPaper() FAILED:', e);
-      }
-    } else {
-      console.log('[BLE Cut] native cutPaper() NOT available.');
-    }
-
-    // 3) ESC/POS cut bytes (only if raw is supported).
-    console.log('[BLE Cut] Step 3: Trying common ESC/POS raw cut commands...');
+    // 2) Try common cutter sequences over BLE
     const wantFull = mode === 'full';
+    const sequences: number[][] = [
+      (wantFull ? [0x1D, 0x56, 0x00] : [0x1D, 0x56, 0x01]), // GS V m
+      [0x1D, 0x56, 0x41, 0x00],                              // GS V 'A' n (some firmwares)
+      [0x1D, 0x56, 0x42, 0x03],                              // GS V 'B' n (feed then cut)
+      (wantFull ? [0x1B, 0x69] : [0x1B, 0x6D]),              // ESC i / ESC m
+    ];
 
-    // GS V 0/1 — full/partial cut
-    const mainCutCmd = wantFull ? [0x1D, 0x56, 0x00] : [0x1D, 0x56, 0x01];
-    console.log(`[BLE Cut] Trying GS V 0/1 (cmd: ${mainCutCmd.map(b => '0x' + b.toString(16)).join(' ')})...`);
-    const triedMain = await this.tryPrintRaw(mainCutCmd);
-    if (triedMain) {
-      console.log('[BLE Cut] GS V 0/1 successful. Returning.');
-      return;
+    for (const seq of sequences) {
+      const ok = await this.tryBleRaw(seq);
+      if (ok) {
+        console.log('[BLE Cut] BLE raw sent', seq.map(b => '0x' + b.toString(16)).join(' '));
+        // give it a moment; if your printer honors BLE cut, this is enough
+        await sleep(80);
+        return; // assume success; avoids double-cut risk
+      }
     }
 
-    // GS V 'B' n — feed then cut
-    const altCutCmd = [0x1D, 0x56, 0x42, 0x03];
-    console.log(`[BLE Cut] Trying GS V 'B' n (cmd: ${altCutCmd.map(b => '0x' + b.toString(16)).join(' ')})...`);
-    const triedAlt = await this.tryPrintRaw(altCutCmd);
-    if (triedAlt) {
-      console.log('[BLE Cut] GS V B n successful. Returning.');
-      return;
+    // 3) BLE ignored cutter -> try once via RFCOMM
+    console.warn('[BLE Cut] BLE path ignored cutter; trying RFCOMM fallback once…');
+    for (const seq of sequences) {
+      const ok = await this.sendClassicOnce(seq);
+      if (ok) {
+        console.log('[BLE Cut] RFCOMM cut sent', seq.map(b => '0x' + b.toString(16)).join(' '));
+        return;
+      }
     }
 
-    // ESC i / ESC m — full/partial cut
-    const escICmd = wantFull ? [0x1B, 0x69] : [0x1B, 0x6D];
-    console.log(`[BLE Cut] Trying ESC i/m (cmd: ${escICmd.map(b => '0x' + b.toString(16)).join(' ')})...`);
-    await this.tryPrintRaw(escICmd);
-
-    console.warn(
-      `[BLE Cut] All attempts to cut paper failed using standard commands and library features.
-       Your BLE build or printer might not support cutting, or require a different raw command.`
-    );
+    console.warn('[BLE Cut] no cut variant succeeded (printer may not have an auto-cutter)');
   }
 }

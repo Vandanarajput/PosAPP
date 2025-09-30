@@ -1,5 +1,5 @@
 // src/services/receiptRenderer.ts
-// Faster, batched printing + simple cut() call at the end.
+// Faster, batched printing + transport-aware cut() at the end.
 
 import type { PrinterTransport } from '../transports/types';
 import { fetchLogoBase64ForPrinter } from './image';
@@ -38,7 +38,7 @@ function wrap(text: string, width: number) {
 const rpad = (s: string, len: number) => (s.length >= len ? s.slice(0, len) : s + ' '.repeat(len - s.length));
 const lpad = (s: string, len: number) => (s.length >= len ? s.slice(s.length - len) : ' '.repeat(len - s.length) + s);
 
-// CHANGE: numeric/decimal alignment helpers (right-aligned with 2 decimals)
+// numeric/decimal alignment helpers (right-aligned with 2 decimals)
 const formatMoney = (n: number) => {
   const v = Number.isFinite(n) ? n : 0;
   return v.toFixed(2);
@@ -81,55 +81,28 @@ async function saneState(t: PrinterTransport) {
   console.log(`${TAG} saneState: done`);
 }
 
-/* -------------------- NEW: cut fallback helper -------------------- */
-async function cutWithFallback(
-  p: { cut?: () => Promise<void>; printRaw?: (b: number[]) => Promise<void> }
-) {
+/* ===================================================================
+   Simple raw cut helper (fallback only):
+   - Feed 5 lines, then send GS V 0 (full cut) if printRaw exists
+=================================================================== */
+async function autoCutSimple(p: { printRaw?: (b: number[]) => Promise<void> }) {
   const TAG = '[receipt]';
-  console.log(`${TAG} cutWithFallback: start`);
+  console.log(`${TAG} cut: start`);
 
-  // Try the library cut first (NetPrinter.cutPaper / BLEPrinter.cutPaper, etc.)
-  if (p.cut) {
-    try {
-      console.log(`${TAG} cutWithFallback: trying native cut()`);
-      await p.cut();
-      console.log(`${TAG} cutWithFallback: native cut() success`);
-      return;
-    } catch (e) {
-      console.warn(`${TAG} cutWithFallback: native cut() failed`, e);
-    }
+  console.log(`${TAG} cut: feeding 5 blank lines`);
+  if (p.printRaw) {
+    await p.printRaw([0x0a, 0x0a, 0x0a, 0x0a, 0x0a]); // 5x LF
+  }
+
+  if (p.printRaw) {
+    console.log(`${TAG} cut: sending GS V 0 (full cut)`);
+    await p.printRaw([0x1d, 0x56, 0x00]);
+    console.log(`${TAG} cut: done`);
   } else {
-    console.log(`${TAG} cutWithFallback: native cut() not available on transport`);
+    console.log(`${TAG} cut: printRaw not available on transport (skipping)`);
   }
-
-  // If no cut(), try raw ESC/POS sequences (Epson TM-m30 friendly)
-  const tries: number[][] = [
-    [0x1B, 0x69],           // ESC i  (full cut)
-    [0x1B, 0x6D],           // ESC m  (partial cut)
-    [0x1D, 0x56, 0x00],     // GS V 0 (full cut)
-    [0x1D, 0x56, 0x01],     // GS V 1 (partial cut)
-    [0x1D, 0x56, 0x42, 0x03]// GS V 'B' n (feed then cut)
-  ];
-
-  if (!p.printRaw) {
-    console.log(`${TAG} cutWithFallback: printRaw not available; cannot send ESC/POS cut bytes`);
-    return;
-  }
-
-  for (const seq of tries) {
-    try {
-      console.log(`${TAG} cutWithFallback: trying raw`, seq.map(b => '0x' + b.toString(16)).join(' '));
-      await p.printRaw?.(seq);
-      console.log(`${TAG} cutWithFallback: raw cut success`);
-      return;
-    } catch (e) {
-      console.warn(`${TAG} cutWithFallback: raw cut attempt failed`, e);
-    }
-  }
-
-  console.warn(`${TAG} cutWithFallback: all cut attempts failed (printer may not support cutter command)`);
 }
-/* ------------------ end NEW helper (only change #1) ---------------- */
+/* =============================== end fallback =============================== */
 
 // ---------- parse ----------
 function parse(json: ReceiptJSON) {
@@ -183,11 +156,18 @@ export async function renderReceipt(
       const t0 = Date.now();
       const { base64, widthDots: imgW } = await fetchLogoBase64ForPrinter(logoUrl, widthDots, logoScale);
       console.log(`${TAG} logo: fetched`, { imgW, b64len: base64.length, ms: Date.now() - t0 });
-      await transport.printImageBase64(base64, { imageWidth: imgW });
-      console.log(`${TAG} logo: printed`);
+
+      // 🔧 BLE quirks:
+      //  - many SDKs require width to be divisible by 8
+      //  - many SDKs require raw base64 (no "data:image/...;base64," prefix)
+      const safeW = Math.max(8, Math.min(widthDots, imgW & ~7));
+      const rawB64 = base64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+
+      await transport.printImageBase64(rawB64, { imageWidth: safeW });
+      console.log(`${TAG} logo: printed (width used: ${safeW})`);
       await transport.printText('\n', {} as any);
     } catch (e) {
-      console.warn(`${TAG} logo: failed to fetch/print`, e);
+      console.log(`${TAG} logo: failed to fetch/print`, e);
     }
   } else {
     console.log(`${TAG} logo: none`);
@@ -223,7 +203,7 @@ export async function renderReceipt(
       rpad('Amount', cols.amount);
     buf.push(head);
 
-    // CHANGE: add a dashed rule directly under the column header
+    // dashed rule directly under the column header
     buf.push(hr(width));
 
     for (let i = 0; i < items.length; i++) {
@@ -236,7 +216,6 @@ export async function renderReceipt(
       const lines = wrap(name, cols.item);
       const first = lines.shift() || '';
 
-      // CHANGE: right-align numeric fields (price/amount) with 2 decimals
       const priceStr  = rAlign(formatMoney(unitPrice), cols.price);
       const amountStr = rAlign(formatMoney(lineTotal), cols.amount);
 
@@ -277,7 +256,6 @@ export async function renderReceipt(
   {
     const lines: string[] = [];
     for (const r of bigRows) {
-      // CHANGE: ensure values on the right stay visually aligned
       lines.push(twoCols(String(r.key ?? ''), String(r.value ?? ''), width));
     }
     if (lines.length) {
@@ -293,7 +271,6 @@ export async function renderReceipt(
   {
     const lines: string[] = [];
     for (const r of sumRows) {
-      // CHANGE: same alignment style for summary rows
       lines.push(twoCols(String(r.key ?? ''), String(r.value ?? ''), width));
     }
     if (lines.length) {
@@ -334,13 +311,13 @@ export async function renderReceipt(
     console.log(`${TAG} thanks: empty`);
   }
 
-  // 8) Feed a bit, then CUT — ONE simple call; best effort on all transports.
-  console.log(`${TAG} feed: printing 2 blank lines before cut`);
-  await transport.printText('\n\n', {} as any);
-
-  /* -------------------- NEW: use fallback cutter ------------------- */
-  await cutWithFallback(transport);
-  /* ---------------- end NEW (replaces transport.cut?.()) ----------- */
+  // 8) Feed + CUT
+  if (typeof (transport as any).cut === 'function') {
+    console.log(`${TAG} cut: using transport.cut('full')`);
+    await (transport as any).cut('full');
+  } else {
+    await autoCutSimple(transport);
+  }
 
   console.log(`${TAG} render done`);
 }

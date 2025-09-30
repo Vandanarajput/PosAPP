@@ -9,7 +9,8 @@ export interface PrintTextOptions {
 }
 
 export interface ImageOptions {
-  imageWidth: number; // printer dot width for the image
+  // CHANGE: make optional to match transports (both accept optional imageWidth)
+  imageWidth?: number; // printer dot width for the image
 }
 
 export interface NetConnectParams {
@@ -35,7 +36,11 @@ export interface PrinterTransport {
   // Raw ESC/POS bytes (optional; some BLE builds don’t expose it)
   printRaw?(bytes: number[]): Promise<void>;
 
-  /** Ask the printer to cut. Implementations should default to 'partial' when mode is omitted. */
+  /**
+   * Ask the printer to cut.
+   * CHANGE: Implementations should default to 'full' when mode is omitted
+   * (matches the 2nd project behavior: feed 5 LFs then GS V 0).
+   */
   cut?(mode?: 'full' | 'partial'): Promise<void>;
 
   disconnect?(): Promise<void>;
