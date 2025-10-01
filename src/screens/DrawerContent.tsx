@@ -32,7 +32,7 @@ import { readPrefs, writePrefs } from '../services/prefs';
 // === LOGGING: import helpers ===
 import { appendLog, mirrorPrefsToPublic } from '../services/logger';
 
-const WIDTH_DOTS = 384;   // 58mm
+const WIDTH_DOTS = 576;   // 58mm
 const LOGO_SCALE = 0.55;
 
 // palette

@@ -3,6 +3,13 @@
 
 import type { PrinterTransport } from '../transports/types';
 import { fetchLogoBase64ForPrinter } from './image';
+// ⬇️ Added: use library’s inline COMMANDS token for alignment
+import { COMMANDS } from 'react-native-thermal-receipt-printer-image-qr';
+
+// Use TEXT_FORMAT tokens from the library
+const CENTER = (COMMANDS as any).TEXT_FORMAT?.TXT_ALIGN_CT ?? '';
+const LEFT   = (COMMANDS as any).TEXT_FORMAT?.TXT_ALIGN_LT ?? '';
+const RIGHT  = (COMMANDS as any).TEXT_FORMAT?.TXT_ALIGN_RT ?? '';
 
 export type RenderOptions = { widthDots: number; logoScale?: number };
 export type ReceiptJSON = {
@@ -129,6 +136,9 @@ export async function renderReceipt(
   transport: PrinterTransport,
   opts: RenderOptions
 ) {
+  await transport.printText('', { align: 'center' } as any);
+  console.log('[renderReceipt] alignment=center set');
+
   const TAG = '[receipt]';
   const { widthDots, logoScale = 0.55 } = opts;
   const width = getCharWidth(receiptJson);
@@ -182,11 +192,13 @@ export async function renderReceipt(
     for (const s of subs) lines.push(s);
     if (lines.length) {
       console.log(`${TAG} header: printing`, { lines });
-      await transport.printText(lines.join('\n') + '\n', { align: 'center', bold: !!title } as any);
+      // ⬇️ Use CENTER token inline
+      await transport.printText(`${CENTER}${lines.join('\n')}\n`, { bold: !!title } as any);
     } else {
       console.log(`${TAG} header: empty`);
     }
-    await transport.printText(hr(width) + '\n', {} as any);
+    // dashed rule centered
+    await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
   }
 
   // 3) Items (1–2 calls max)
@@ -248,8 +260,9 @@ export async function renderReceipt(
     }
 
     console.log(`${TAG} items: printing`, { lines: buf.length });
-    await transport.printText(buf.join('\n') + '\n', { bold: true } as any);
-    await transport.printText(hr(width) + '\n', {} as any);
+    // ⬇️ Center items block + rule via token
+    await transport.printText(`${CENTER}${buf.join('\n')}\n`, { bold: true } as any);
+    await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
   }
 
   // 4) Big summary (one call)
@@ -260,8 +273,9 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} bigSummary: printing`, { linesCount: lines.length });
-      await transport.printText(lines.join('\n') + '\n', {} as any);
-      await transport.printText(hr(width) + '\n', {} as any);
+      // ⬇️ Center via token
+      await transport.printText(`${CENTER}${lines.join('\n')}\n`);
+      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} bigSummary: empty`);
     }
@@ -275,8 +289,9 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} summary: printing`, { linesCount: lines.length });
-      await transport.printText(lines.join('\n') + '\n', {} as any);
-      await transport.printText(hr(width) + '\n', {} as any);
+      // ⬇️ Center via token
+      await transport.printText(`${CENTER}${lines.join('\n')}\n`);
+      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} summary: empty`);
     }
@@ -296,9 +311,10 @@ export async function renderReceipt(
       right: rightLines.length,
     });
 
-    if (leftLines.length) await transport.printText(leftLines.join('\n') + '\n', { align: 'left' } as any);
-    if (centerLines.length) await transport.printText(centerLines.join('\n') + '\n', { align: 'center' } as any);
-    if (rightLines.length) await transport.printText(rightLines.join('\n') + '\n', { align: 'right' } as any);
+    // (Keeping footer behavior as-is; CENTER token used only where needed)
+    if (leftLines.length)  await transport.printText(`${LEFT}${leftLines.join('\n')}\n`);
+    if (centerLines.length) await transport.printText(`${CENTER}${centerLines.join('\n')}\n`);
+    if (rightLines.length) await transport.printText(`${RIGHT}${rightLines.join('\n')}\n`);
   } else {
     console.log(`${TAG} footers: none`);
   }
@@ -306,7 +322,8 @@ export async function renderReceipt(
   // 7) Thank-you (one line)
   if (thank) {
     console.log(`${TAG} thanks: printing`, { thank });
-    await transport.printText(thank + '\n', { align: 'center' } as any);
+    // ⬇️ Center via token
+    await transport.printText(`${CENTER}${thank}\n`);
   } else {
     console.log(`${TAG} thanks: empty`);
   }

@@ -52,6 +52,26 @@ export class BLEPrinterService implements PrinterTransport {
       console.error('[BLE ERROR] printText() not available.');
       throw new Error('BLE printText() not available');
     }
+
+    // ----- Added: apply alignment (ESC a n) and bold (ESC E n) before printing -----
+    try {
+      const a =
+        opts?.align === 'center' ? 1 :
+        opts?.align === 'right'  ? 2 : 0;
+
+      // ESC a n  → 0=left, 1=center, 2=right
+      await this.printRaw([0x1B, 0x61, a]);
+
+      if (typeof opts?.bold !== 'undefined') {
+        // ESC E n  → 0=off, 1=on
+        await this.printRaw([0x1B, 0x45, opts.bold ? 0x01 : 0x00]);
+      }
+    } catch (e) {
+      // Best-effort; if raw isn’t supported we still print the text.
+      console.warn('[BLE] align/bold preamble failed (continuing):', e);
+    }
+    // -------------------------------------------------------------------------------
+
     await BLEPrinter.printText(text, opts || {});
   }
 
