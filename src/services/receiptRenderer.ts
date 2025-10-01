@@ -3,7 +3,7 @@
 
 import type { PrinterTransport } from '../transports/types';
 import { fetchLogoBase64ForPrinter } from './image';
-// ⬇️ Added: use library’s inline COMMANDS token for alignment
+// ⬇️ Use library’s inline COMMANDS token for alignment
 import { COMMANDS } from 'react-native-thermal-receipt-printer-image-qr';
 
 // Use TEXT_FORMAT tokens from the library
@@ -45,6 +45,16 @@ function wrap(text: string, width: number) {
 const rpad = (s: string, len: number) => (s.length >= len ? s.slice(0, len) : s + ' '.repeat(len - s.length));
 const lpad = (s: string, len: number) => (s.length >= len ? s.slice(s.length - len) : ' '.repeat(len - s.length) + s);
 
+// center-pad inside a fixed width (centers content INSIDE columns)
+const cpad = (s: string, len: number) => {
+  s = String(s ?? '');
+  if (s.length >= len) return s.slice(0, len);
+  const total = len - s.length;
+  const left = Math.floor(total / 2);
+  const right = total - left;
+  return ' '.repeat(left) + s + ' '.repeat(right);
+};
+
 // numeric/decimal alignment helpers (right-aligned with 2 decimals)
 const formatMoney = (n: number) => {
   const v = Number.isFinite(n) ? n : 0;
@@ -61,6 +71,14 @@ function twoCols(left: string, right: string, width: number) {
   return lt + ' '.repeat(spaces) + right;
 }
 
+// two columns where each half is center-padded
+function twoColsCentered(left: string, right: string, width: number) {
+  const gap = 1;
+  const leftW = Math.floor((width - gap) / 2);
+  const rightW = width - gap - leftW;
+  return cpad(left, leftW) + ' '.repeat(gap) + cpad(right, rightW);
+}
+
 function computeCols(total: number) {
   // Item | Qty | Price | Amount
   const qty = 4;
@@ -69,6 +87,21 @@ function computeCols(total: number) {
   const gaps = 3;
   const item = Math.max(8, total - (qty + price + amount + gaps));
   return { item, qty, price, amount };
+}
+
+// limit for item-name wrap (keeps names on one line unless >30 chars)
+const ITEM_NAME_WRAP = 30;
+
+// ---------- NEW: totals aligned to the same "Amount" column ----------
+const AMOUNT_GAP = 3; // increase for a bigger space between label and number
+
+function amountAlignedRow(label: string, value: string | number, width: number) {
+  const cols = computeCols(width);
+  const gap = AMOUNT_GAP;
+  const leftW = Math.max(1, width - cols.amount - gap);
+  const labelText = String(label ?? '');
+  const valueText = String(value ?? '');
+  return rpad(labelText, leftW) + ' '.repeat(gap) + rAlign(valueText, cols.amount);
 }
 
 // ---------- device state (optional, only if raw supported) ----------
@@ -167,7 +200,7 @@ export async function renderReceipt(
       const { base64, widthDots: imgW } = await fetchLogoBase64ForPrinter(logoUrl, widthDots, logoScale);
       console.log(`${TAG} logo: fetched`, { imgW, b64len: base64.length, ms: Date.now() - t0 });
 
-      // 🔧 BLE quirks:
+      // BLE quirks:
       //  - many SDKs require width to be divisible by 8
       //  - many SDKs require raw base64 (no "data:image/...;base64," prefix)
       const safeW = Math.max(8, Math.min(widthDots, imgW & ~7));
@@ -192,12 +225,12 @@ export async function renderReceipt(
     for (const s of subs) lines.push(s);
     if (lines.length) {
       console.log(`${TAG} header: printing`, { lines });
-      // ⬇️ Use CENTER token inline
-      await transport.printText(`${CENTER}${lines.join('\n')}\n`, { bold: !!title } as any);
+      const centeredHeader = lines.map(l => `${CENTER}${l}`).join('\n') + '\n';
+      await transport.printText(centeredHeader, { bold: !!title } as any);
     } else {
       console.log(`${TAG} header: empty`);
     }
-    // dashed rule centered
+    // print a rule right under "Takeaway"
     await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
   }
 
@@ -208,11 +241,12 @@ export async function renderReceipt(
 
     const buf: string[] = [];
 
+    // header cells centered inside columns
     const head =
-      rpad('Item', cols.item) + ' ' +
-      rpad('Qty', cols.qty) + ' ' +
-      rpad('Price', cols.price) + ' ' +
-      rpad('Amount', cols.amount);
+      cpad('Item',   cols.item)   + ' ' +
+      cpad('Qty',    cols.qty)    + ' ' +
+      cpad('Price',  cols.price)  + ' ' +
+      cpad('Amount', cols.amount);
     buf.push(head);
 
     // dashed rule directly under the column header
@@ -225,96 +259,92 @@ export async function renderReceipt(
       const lineTotal = Number(it.item_amount ?? it.price ?? 0);
       const unitPrice = qtyN ? lineTotal / qtyN : lineTotal;
 
-      const lines = wrap(name, cols.item);
+      // keep on one line unless >30 chars
+      const nameWrap = Math.min(cols.item, ITEM_NAME_WRAP);
+      const lines = wrap(name, nameWrap);
       const first = lines.shift() || '';
 
-      const priceStr  = rAlign(formatMoney(unitPrice), cols.price);
-      const amountStr = rAlign(formatMoney(lineTotal), cols.amount);
+      // center content inside price/amount columns
+      const priceStr  = cpad(formatMoney(unitPrice), cols.price);
+      const amountStr = cpad(formatMoney(lineTotal), cols.amount);
 
       const row =
-        rpad(first, cols.item) + ' ' +
-        rpad(String(qtyN), cols.qty) + ' ' +
+        cpad(first,        cols.item)  + ' ' +
+        cpad(String(qtyN), cols.qty)   + ' ' +
         priceStr + ' ' +
         amountStr;
       buf.push(row);
 
+      // wrapped continuation lines under Item column (centered within the column)
       for (const tail of lines) {
         buf.push(
-          rpad(tail, cols.item) + ' ' +
-          rpad('',   cols.qty)   + ' ' +
-          rpad('',   cols.price) + ' ' +
-          rpad('',   cols.amount)
+          cpad(tail, cols.item) + ' ' +
+          cpad('',   cols.qty)  + ' ' +
+          cpad('',   cols.price)+ ' ' +
+          cpad('',   cols.amount)
         );
       }
 
+      // optional subLine (also centered inside the Item column)
       if (it.item_subLine) {
         for (const s of wrap(String(it.item_subLine), cols.item - 2)) {
           buf.push(
-            rpad('  ' + s, cols.item) + ' ' +
-            rpad('', cols.qty) + ' ' +
-            rpad('', cols.price) + ' ' +
-            rpad('', cols.amount)
+            cpad('  ' + s, cols.item) + ' ' +
+            cpad('', cols.qty) + ' ' +
+            cpad('', cols.price) + ' ' +
+            cpad('', cols.amount)
           );
         }
       }
     }
 
     console.log(`${TAG} items: printing`, { lines: buf.length });
-    // ⬇️ Center items block + rule via token
-    await transport.printText(`${CENTER}${buf.join('\n')}\n`, { bold: true } as any);
+    // prefix CENTER to every line so the library centers each printed row
+    const itemsOut = buf.map(l => `${CENTER}${l}`).join('\n') + '\n';
+    await transport.printText(itemsOut, { bold: true } as any);
     await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
   }
 
-  // 4) Big summary (one call)
+  // 4) Big summary (one call) — labels + numbers aligned to "Amount" column
   {
     const lines: string[] = [];
     for (const r of bigRows) {
-      lines.push(twoCols(String(r.key ?? ''), String(r.value ?? ''), width));
+      lines.push(amountAlignedRow(String(r.key ?? ''), String(r.value ?? ''), width));
     }
     if (lines.length) {
       console.log(`${TAG} bigSummary: printing`, { linesCount: lines.length });
-      // ⬇️ Center via token
-      await transport.printText(`${CENTER}${lines.join('\n')}\n`);
+      const bigOut = lines.map(l => `${CENTER}${l}`).join('\n') + '\n';
+      await transport.printText(bigOut);
       await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} bigSummary: empty`);
     }
   }
 
-  // 5) Summary (one call)
+  // 5) Summary (one call) — labels + numbers aligned to "Amount" column
   {
     const lines: string[] = [];
     for (const r of sumRows) {
-      lines.push(twoCols(String(r.key ?? ''), String(r.value ?? ''), width));
+      lines.push(amountAlignedRow(String(r.key ?? ''), String(r.value ?? ''), width));
     }
     if (lines.length) {
       console.log(`${TAG} summary: printing`, { linesCount: lines.length });
-      // ⬇️ Center via token
-      await transport.printText(`${CENTER}${lines.join('\n')}\n`);
+      const sumOut = lines.map(l => `${CENTER}${l}`).join('\n') + '\n';
+      await transport.printText(sumOut);
       await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} summary: empty`);
     }
   }
 
-  // 6) Footers (group by align to reduce calls)
+  // 6) Footers — force center every line
   if (Array.isArray(footers) && footers.length) {
-    const leftLines = footers.filter(f => (f?.align ?? 'left') === 'left')
-                             .flatMap(f => f.footer_text || []);
-    const centerLines = footers.filter(f => f?.align === 'center')
-                               .flatMap(f => f.footer_text || []);
-    const rightLines = footers.filter(f => f?.align === 'right')
-                              .flatMap(f => f.footer_text || []);
-    console.log(`${TAG} footers: printing`, {
-      left: leftLines.length,
-      center: centerLines.length,
-      right: rightLines.length,
-    });
-
-    // (Keeping footer behavior as-is; CENTER token used only where needed)
-    if (leftLines.length)  await transport.printText(`${LEFT}${leftLines.join('\n')}\n`);
-    if (centerLines.length) await transport.printText(`${CENTER}${centerLines.join('\n')}\n`);
-    if (rightLines.length) await transport.printText(`${RIGHT}${rightLines.join('\n')}\n`);
+    const allFooterLines = footers.flatMap(f => f?.footer_text || []);
+    console.log(`${TAG} footers: printing (force-center)`, { count: allFooterLines.length });
+    if (allFooterLines.length) {
+      const footOut = allFooterLines.map(l => `${CENTER}${l}`).join('\n') + '\n';
+      await transport.printText(footOut);
+    }
   } else {
     console.log(`${TAG} footers: none`);
   }
@@ -322,7 +352,6 @@ export async function renderReceipt(
   // 7) Thank-you (one line)
   if (thank) {
     console.log(`${TAG} thanks: printing`, { thank });
-    // ⬇️ Center via token
     await transport.printText(`${CENTER}${thank}\n`);
   } else {
     console.log(`${TAG} thanks: empty`);
