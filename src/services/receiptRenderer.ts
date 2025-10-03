@@ -230,23 +230,24 @@ export async function renderReceipt(
     } else {
       console.log(`${TAG} header: empty`);
     }
-    // print a rule right under "Takeaway"
-    await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+    // print a rule right under "Takeaway" — HARD LEFT to reset state
+    await transport.printText(LEFT, {} as any);
+    await transport.printText(`${hr(width)}\n`, {} as any);
   }
 
-  // 3) Items (1–2 calls max)
+  // 3) Items (stable, left-aligned grid)
   {
     const cols = computeCols(width);
     console.log(`${TAG} items: columns`, cols);
 
     const buf: string[] = [];
 
-    // header cells centered inside columns
+    // header: left overall, numeric columns right-aligned
     const head =
-      cpad('Item',   cols.item)   + ' ' +
-      cpad('Qty',    cols.qty)    + ' ' +
-      cpad('Price',  cols.price)  + ' ' +
-      cpad('Amount', cols.amount);
+      rpad('Item',  cols.item)  + ' ' +
+      rAlign('Qty', cols.qty)   + ' ' +
+      rAlign('Price', cols.price) + ' ' +
+      rAlign('Amount', cols.amount);
     buf.push(head);
 
     // dashed rule directly under the column header
@@ -264,48 +265,47 @@ export async function renderReceipt(
       const lines = wrap(name, nameWrap);
       const first = lines.shift() || '';
 
-      // center content inside price/amount columns
-      const priceStr  = cpad(formatMoney(unitPrice), cols.price);
-      const amountStr = cpad(formatMoney(lineTotal), cols.amount);
-
       const row =
-        cpad(first,        cols.item)  + ' ' +
-        cpad(String(qtyN), cols.qty)   + ' ' +
-        priceStr + ' ' +
-        amountStr;
+        rpad(first, cols.item) + ' ' +
+        rAlign(String(qtyN), cols.qty) + ' ' +
+        rAlign(formatMoney(unitPrice), cols.price) + ' ' +
+        rAlign(formatMoney(lineTotal), cols.amount);
       buf.push(row);
 
-      // wrapped continuation lines under Item column (centered within the column)
+      // wrapped continuation lines under Item column (keep other columns empty)
       for (const tail of lines) {
         buf.push(
-          cpad(tail, cols.item) + ' ' +
-          cpad('',   cols.qty)  + ' ' +
-          cpad('',   cols.price)+ ' ' +
-          cpad('',   cols.amount)
+          rpad(tail, cols.item) + ' ' +
+          ' '.repeat(cols.qty)  + ' ' +
+          ' '.repeat(cols.price)+ ' ' +
+          ' '.repeat(cols.amount)
         );
       }
 
-      // optional subLine (also centered inside the Item column)
+      // optional subLine under item column only
       if (it.item_subLine) {
-        for (const s of wrap(String(it.item_subLine), cols.item - 2)) {
+        for (const s of wrap(String(it.item_subLine), Math.max(4, cols.item - 2))) {
           buf.push(
-            cpad('  ' + s, cols.item) + ' ' +
-            cpad('', cols.qty) + ' ' +
-            cpad('', cols.price) + ' ' +
-            cpad('', cols.amount)
+            rpad('  ' + s, cols.item) + ' ' +
+            ' '.repeat(cols.qty)  + ' ' +
+            ' '.repeat(cols.price)+ ' ' +
+            ' '.repeat(cols.amount)
           );
         }
       }
     }
 
     console.log(`${TAG} items: printing`, { lines: buf.length });
-    // prefix CENTER to every line so the library centers each printed row
-    const itemsOut = buf.map(l => `${CENTER}${l}`).join('\n') + '\n';
-    await transport.printText(itemsOut, { bold: true } as any);
-    await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+    const itemsOut = buf.join('\n') + '\n';
+
+    // HARD LEFT before table & divider to cancel any lingering CENTER
+    await transport.printText(LEFT, {} as any);
+    await transport.printText(itemsOut, {} as any);
+    await transport.printText(LEFT, {} as any);
+    await transport.printText(`${hr(width)}\n`, {} as any);
   }
 
-  // 4) Big summary (one call) — labels + numbers aligned to "Amount" column
+  // 4) Big summary (left aligned; align numbers to Amount column)
   {
     const lines: string[] = [];
     for (const r of bigRows) {
@@ -313,15 +313,17 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} bigSummary: printing`, { linesCount: lines.length });
-      const bigOut = lines.map(l => `${CENTER}${l}`).join('\n') + '\n';
-      await transport.printText(bigOut);
-      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+      const bigOut = lines.join('\n') + '\n';
+      await transport.printText(LEFT, {} as any);
+      await transport.printText(bigOut, {} as any);
+      await transport.printText(LEFT, {} as any);
+      await transport.printText(`${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} bigSummary: empty`);
     }
   }
 
-  // 5) Summary (one call) — labels + numbers aligned to "Amount" column
+  // 5) Summary (Paid/Change…): single-line rows, left aligned
   {
     const lines: string[] = [];
     for (const r of sumRows) {
@@ -329,9 +331,11 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} summary: printing`, { linesCount: lines.length });
-      const sumOut = lines.map(l => `${CENTER}${l}`).join('\n') + '\n';
-      await transport.printText(sumOut);
-      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+      const sumOut = lines.join('\n') + '\n';
+      await transport.printText(LEFT, {} as any);
+      await transport.printText(sumOut, {} as any);
+      await transport.printText(LEFT, {} as any);
+      await transport.printText(`${hr(width)}\n`, {} as any);
     } else {
       console.log(`${TAG} summary: empty`);
     }
