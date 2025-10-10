@@ -14,22 +14,29 @@ import {
   StyleSheet,
   DeviceEventEmitter,
   AppState,
+  Switch,
 } from 'react-native';
-import {
-  DrawerContentScrollView,
-  type DrawerContentComponentProps,
-} from '@react-navigation/drawer';
-
+import { DrawerContentScrollView, type DrawerContentComponentProps } from '@react-navigation/drawer';
 import RNBluetoothClassic from 'react-native-bluetooth-classic';
 
 import { BLEPrinterService } from '../transports/blePrinter';
 import { NetPrinterService } from '../transports/netPrinter';
 import { renderReceipt } from '../services/receiptRenderer';
 import receiptJson from '../assets/receipt.json';
-import { readPrefs, writePrefs } from '../services/prefs';
+
+import {
+  readPrefs,
+  writePrefs,
+  getNetPrinters,
+  setNetPrinters,
+  getEnableMultiNet,
+  setEnableMultiNet,
+  DEFAULT_NET_PORT,
+  DEFAULT_WIDTH_DOTS,
+} from '../services/prefs';
+import type { NetPrinterProfile } from '../services/prefs';
 import { appendLog, mirrorPrefsToPublic } from '../services/logger';
 
-// ---- helpers ----
 function errMsg(e: unknown): string {
   if (e instanceof Error && e.message) return e.message;
   if (typeof e === 'string') return e;
@@ -37,15 +44,15 @@ function errMsg(e: unknown): string {
 }
 const sleep = (ms: number) => new Promise<void>(res => setTimeout(() => res(), ms));
 
-const WIDTH_DOTS = 576; // NOTE: many 58mm printers are ~384 dots; verify your model
+const WIDTH_DOTS = 576;
 const LOGO_SCALE = 0.55;
 
-// palette
 const PRIMARY = '#6D28D9';
 const BORDER = '#E5E7EB';
 const SUBTLE = '#6B7280';
 const DISABLED_BG = '#F1EFF9';
 const DISABLED_TXT = '#8C7DB5';
+const RED = '#EF4444';
 
 async function ensureBtPerms() {
   if (Platform.OS !== 'android') return true;
@@ -59,40 +66,149 @@ async function ensureBtPerms() {
   return Object.values(res).every(v => v === PermissionsAndroid.RESULTS.GRANTED);
 }
 
+// tiny getters
+function get(obj: any, path: string, fallback?: any) {
+  try {
+    const segs = path.split('.').filter(Boolean);
+    let cur = obj;
+    for (const s of segs) cur = cur?.[s];
+    return cur ?? fallback;
+  } catch { return fallback; }
+}
+const asStrArray = (v: any) =>
+  Array.isArray(v) ? v.filter((x: any) => typeof x === 'string' && x.trim()) :
+  (typeof v === 'string' && v.trim() ? [v.trim()] : []);
+
+// ------- robust IP helpers -------
+function parseIpToken(token: string): { host: string; port: number; hasPort: boolean } {
+  const raw = (token || '').trim();
+  const [h, p] = raw.split(':').map(s => s.trim());
+  const port = p ? Number(p) || DEFAULT_NET_PORT : DEFAULT_NET_PORT;
+  return { host: h, port, hasPort: !!p };
+}
+function normalizeHost(h: any) { return String(h || '').trim(); }
+function normalizePort(p: any) {
+  const n = typeof p === 'number' ? p : Number(p);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_NET_PORT;
+}
+
+// Robust match: if token has port, require exact host+port.
+// If token has no port, match any saved printer with same host (prefer 9100).
+function findSavedByIpToken(ipToken: string, list: NetPrinterProfile[]): NetPrinterProfile | null {
+  const { host: tHost, port: tPort, hasPort } = parseIpToken(ipToken);
+  if (!tHost) return null;
+  const scored: Array<{ score: number; prof: NetPrinterProfile }> = [];
+
+  for (const prof of list || []) {
+    const pHost = normalizeHost(prof.host);
+    const pPort = normalizePort((prof as any).port);
+    if (!pHost) continue;
+
+    if (hasPort) {
+      if (pHost === tHost && pPort === tPort) scored.push({ score: 100, prof });
+    } else {
+      if (pHost === tHost) scored.push({ score: pPort === DEFAULT_NET_PORT ? 55 : 50, prof });
+    }
+  }
+  if (!scored.length) return null;
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].prof;
+}
+
+// Multi-IP tolerant extractor for kitchen
+function getKitchenIpsFromBlock(k: any): string[] {
+  const keys = ['ip_address', 'Ip_address', 'IP_ADDRESS', 'ipAddress', 'IpAddress'];
+  const vals:any[]=[];
+  for (const x of keys) if (k?.[x] != null) vals.push(k[x]);
+  for (const x of keys) if (k?.data?.[x] != null) vals.push(k.data[x]);
+
+  const out:string[]=[];
+  for (const v of vals) {
+    if (Array.isArray(v)) {
+      v.forEach(s => { if (typeof s === 'string' && s.trim()) out.push(s.trim()); });
+    } else if (typeof v === 'string') {
+      v.split(',').forEach(p => { const q = p.trim(); if (q) out.push(q); });
+    }
+  }
+  return Array.from(new Set(out));
+}
+
+// extract ip targets from your JSON (first kitchen only — used by legacy paths)
+function extractIpTargets(payload: any) {
+  const settingBlock = (payload?.data || []).find((b: any) => b?.type === 'setting');
+  const cashierIps = asStrArray(get(settingBlock, 'data.ip_address', undefined));
+  const kitchenBlock = (payload?.data || []).find((b: any) => b?.type === 'kitchen_print');
+  const kitchenIps = kitchenBlock ? getKitchenIpsFromBlock(kitchenBlock) : [];
+  const individual = String(kitchenBlock?.individual_print ?? '0') === '1';
+  return { cashierIps, kitchenIps, individual, kitchenBlock };
+}
+
+// build kitchen-only payloads
+function buildKitchenPayload(payload: any, kitchenBlock: any) {
+  const clone = { ...payload };
+  clone.data = [kitchenBlock];
+  return clone;
+}
+function buildSingleKitchenItemPayload(payload: any, kitchenBlock: any, item: any) {
+  const single = JSON.parse(JSON.stringify(kitchenBlock));
+  single.data = { ...(single.data || {}), itemdata: [item] };
+  const clone = { ...payload, data: [single] };
+  return clone;
+}
+
+// ---- NEW: explicit type to fix "k implicitly has 'any'" ----
+type KitchenEntry = {
+  block: any;
+  ips: string[];
+  individual: boolean;
+  idx: number;
+};
+
 export default function DrawerContent(_props: DrawerContentComponentProps) {
   const [busy, setBusy] = useState(false);
   const [activeTransport, setActiveTransport] = useState<'ble' | 'lan' | null>(null);
 
-  // BLE UI state
+  // BLE
   const [bleList, setBleList] = useState<any[]>([]);
   const [pickerVisible, setPickerVisible] = useState(false);
   const [bleDevice, setBleDevice] = useState<{ name: string; mac: string } | null>(null);
   const [bleConnected, setBleConnected] = useState(false);
 
-  // LAN state
+  // legacy single-LAN
   const [host, setHost] = useState('');
   const [port, setPort] = useState('9100');
   const [lanConnected, setLanConnected] = useState(false);
 
+  // multi-LAN
+  const [enableMultiNet, setEnableMultiNetUI] = useState(false);
+  const [savedPrinters, setSavedPrinters] = useState<NetPrinterProfile[]>([]);
+
+  // Add printer modal
+  const [addModal, setAddModal] = useState(false);
+  const [newIp, setNewIp] = useState('');
+  const [newPort, setNewPort] = useState('9100');
+
+  // Edit printer modal
+  const [editModal, setEditModal] = useState(false);
+  const [editIndex, setEditIndex] = useState<number | null>(null);
+  const [editIp, setEditIp] = useState('');
+  const [editPort, setEditPort] = useState('9100');
+
   const triedBleOnce = useRef(false);
   const triedNetOnce = useRef(false);
 
-  // Keep these as long-lived instances for “Connect/Disconnect” UI only.
   const ble = useMemo(() => new BLEPrinterService(), []);
   const lan = useMemo(() => new NetPrinterService(), []);
 
-  // ---------- Bluetooth ----------
+  // ---------- BLE ----------
   const openDevicePicker = async () => {
     try {
       setBusy(true);
-      await appendLog('[BLE] openDevicePicker: request perms & list devices');
       if (!(await ensureBtPerms())) {
-        await appendLog('[BLE] permissions denied');
         Alert.alert('Permission required', 'Enable Bluetooth & Location permissions.');
         return;
       }
       const list = await RNBluetoothClassic.getBondedDevices();
-      await appendLog(`[BLE] bonded devices = ${list?.length || 0}`);
       if (!list?.length) {
         Alert.alert('No devices', 'Pair your printer in Android Bluetooth settings first.');
         return;
@@ -100,65 +216,47 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       setBleList(list);
       setPickerVisible(true);
     } catch (e) {
-      await appendLog(`[BLE] openDevicePicker ERROR: ${errMsg(e)}`);
       Alert.alert('Bluetooth', errMsg(e) || 'Failed to list devices.');
     } finally {
       setBusy(false);
     }
   };
-
   const selectDevice = (d: any) => {
     setBleDevice({ name: d.name || d.device_name || 'Printer', mac: d.address });
-    appendLog(`[BLE] selected ${d.name || d.device_name} (${d.address})`);
     setPickerVisible(false);
   };
-
   const connectBluetooth = async () => {
     if (!bleDevice) return Alert.alert('Select Device', 'Please select a Bluetooth printer.');
     try {
       setBusy(true);
-      await appendLog(`[BLE] connect to ${bleDevice.name} (${bleDevice.mac})`);
       await ble.init();
       await ble.connect(bleDevice.mac);
       setBleConnected(true);
       setActiveTransport('ble');
       await writePrefs({ btAddress: bleDevice.mac, btName: bleDevice.name });
       await mirrorPrefsToPublic();
-      await appendLog('[BLE] connected & prefs saved');
       Alert.alert('Bluetooth', 'Connected.');
     } catch (e) {
-      await appendLog(`[BLE] connect ERROR: ${errMsg(e)}`);
       Alert.alert('Bluetooth', errMsg(e) || 'Failed to connect.');
     } finally {
       setBusy(false);
     }
   };
-
-  // ---- BLE PRINT: fresh service per print to avoid stale sockets
   const printReceiptBle = async () => {
     if (!bleDevice?.mac) return Alert.alert('Select Device', 'Choose a Bluetooth printer first.');
     try {
       setBusy(true);
-      await appendLog(`[BLE] printReceipt START -> fresh session for ${bleDevice.name} (${bleDevice.mac})`);
-
       if (!(await ensureBtPerms())) {
-        await appendLog('[BLE] missing permissions at print time');
         Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
         return;
       }
-
-      // Best effort: close any previous lingering session on the long-lived instance
       try { await ble.disconnect?.(); } catch {}
-
-      // Fresh per-print session
       const session = new BLEPrinterService();
       await session.init();
       await session.connect(bleDevice.mac);
-
       try {
         await renderReceipt(receiptJson as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
       } catch {
-        await appendLog('[BLE] first print failed; recreate session & retry once');
         try { await session.disconnect?.(); } catch {}
         const session2 = new BLEPrinterService();
         await session2.init();
@@ -166,47 +264,171 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
         await renderReceipt(receiptJson as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
         try { await session2.disconnect?.(); } catch {}
       }
-
-      await sleep(150); // let device flush
+      await sleep(150);
       try { await session.disconnect?.(); } catch {}
-
-      await appendLog('[BLE] printReceipt DONE');
       setBleConnected(true);
     } catch (e) {
-      await appendLog(`[BLE] print ERROR: ${errMsg(e)}`);
       Alert.alert('Print', errMsg(e) || 'Failed to print receipt.');
     } finally {
       setBusy(false);
     }
   };
 
-  // ---------- Network ----------
+  // -------------- MULTI-LAN CORE --------------
+  async function printToSingleNetProfile(profile: NetPrinterProfile, payload: any, tag: string) {
+    const host = profile.host;
+    const port = (typeof profile.port === 'number' && profile.port > 0) ? profile.port : DEFAULT_NET_PORT;
+    const widthDots = (profile.widthDots === 384 || profile.widthDots === 576) ? profile.widthDots : DEFAULT_WIDTH_DOTS;
+
+    await appendLog(`${tag} [saved-route] connect ${host}:${port} (widthDots=${widthDots})`);
+    await lan.init();
+    await lan.connect({ host, port });
+
+    try {
+      await renderReceipt(payload, lan, { widthDots, logoScale: LOGO_SCALE });
+      await appendLog(`${tag} [saved-route] printed to ${host}:${port}`);
+    } catch (e) {
+      await appendLog(`${tag} [saved-route] first try failed, retrying once: ${errMsg(e)}`);
+      await lan.init();
+      await lan.connect({ host, port });
+      await renderReceipt(payload, lan, { widthDots, logoScale: LOGO_SCALE });
+      await appendLog(`${tag} [saved-route] printed (retry) to ${host}:${port}`);
+    }
+    await sleep(150);
+    await lan.disconnect?.();
+  }
+
+  // ***** FIXED: print ALL kitchen_print blocks (with types to satisfy TS) *****
+  async function handleMultiLanPrint(json: any, tag: string): Promise<{ handled: boolean; matched: boolean }> {
+    // Cashier IPs from setting block
+    const settingBlock = (json?.data || []).find((b: any) => b?.type === 'setting');
+    const cashierIps = asStrArray(get(settingBlock, 'data.ip_address', undefined));
+
+    // ALL kitchen_print blocks
+    const kitchenBlocks = (json?.data || []).filter((b: any) => b?.type === 'kitchen_print') as any[];
+
+    const kitchenEntries: KitchenEntry[] = kitchenBlocks.map(
+      (block: any, idx: number): KitchenEntry => ({
+        block,
+        ips: getKitchenIpsFromBlock(block),
+        individual: String(block?.individual_print ?? '0') === '1',
+        idx,
+      })
+    );
+
+    await appendLog(
+      `${tag} parsed cashierIps=[${cashierIps.join(', ')}], ` +
+      `kitchenBlocks=${kitchenEntries.length} (${kitchenEntries
+        .map((k: KitchenEntry) => `#${k.idx}[${k.ips.join(', ')}]`)
+        .join('; ')})`
+    );
+
+    const hasAnyKitchenIp = kitchenEntries.some((k: KitchenEntry) => k.ips.length > 0);
+    if (cashierIps.length === 0 && !hasAnyKitchenIp) {
+      await appendLog(`${tag} [saved-route] no ip_address found in JSON; not handled`);
+      return { handled: false, matched: false };
+    }
+
+    const list = savedPrinters;
+    try { await appendLog(`${tag} savedPrinters: ${list.map(p => `${p.host}:${normalizePort((p as any).port)}`).join(', ')}`); } catch {}
+
+    const targets: Array<{
+      profile: NetPrinterProfile;
+      type: 'cashier' | 'kitchen';
+      blockIdx?: number;
+      item?: any;
+    }> = [];
+
+    // Cashier (full receipt) targets
+    for (const ip of cashierIps) {
+      const prof = findSavedByIpToken(ip, list);
+      await appendLog(`${tag} cashier target token="${ip}" -> ${prof ? `match ${prof.host}:${normalizePort((prof as any).port)}` : 'no match'}`);
+      if (prof) targets.push({ profile: prof, type: 'cashier' });
+    }
+
+    // Kitchen targets for EVERY kitchen_print block
+    for (const entry of kitchenEntries) {
+      const { block, ips, individual, idx } = entry;
+      if (ips.length === 0) continue;
+
+      for (const ip of ips) {
+        const prof = findSavedByIpToken(ip, list);
+        await appendLog(`${tag} kitchen#${idx} target token="${ip}" -> ${prof ? `match ${prof.host}:${normalizePort((prof as any).port)}` : 'no match'}`);
+        if (!prof) continue;
+
+        if (individual) {
+          const items = (block?.data?.itemdata || []) as any[];
+          for (const it of items) targets.push({ profile: prof, type: 'kitchen', blockIdx: idx, item: it });
+        } else {
+          targets.push({ profile: prof, type: 'kitchen', blockIdx: idx });
+        }
+      }
+    }
+
+    if (targets.length === 0) {
+      await appendLog(`${tag} [saved-route] no saved printer matched any ip_address token`);
+      return { handled: true, matched: false };
+    }
+
+    // Dedupe by host:port + type + blockIdx + item identity
+    const seen = new Set<string>();
+    const uniqueTargets = targets.filter(t => {
+      const host = t.profile.host;
+      const port = (t.profile.port || DEFAULT_NET_PORT);
+      const itemKey = t.item ? `${t.item.item_name || ''}#${t.item.display_index || ''}` : '';
+      const key = `${host}:${port}|${t.type}|b${t.blockIdx ?? -1}|${itemKey}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    await appendLog(`${tag} [saved-route] ${uniqueTargets.length} target(s) after dedupe`);
+
+    // Execute prints
+    for (const t of uniqueTargets) {
+      const copies = (typeof (t.profile as any).copies === 'number' && (t.profile as any).copies > 0) ? (t.profile as any).copies : 1;
+      const label = t.type === 'cashier'
+        ? 'cashier/full'
+        : (t.item ? `kitchen#${t.blockIdx} (per-item)` : `kitchen#${t.blockIdx} (group)`);
+
+      await appendLog(`${tag} [saved-route] -> ${label} to ${t.profile.host}:${(t.profile.port || DEFAULT_NET_PORT)} (copies=${copies})`);
+
+      if (t.type === 'cashier') {
+        for (let i = 0; i < copies; i++) {
+          await printToSingleNetProfile(t.profile, json, tag);
+        }
+      } else {
+        const block = kitchenBlocks[t.blockIdx ?? 0];
+        if (!block) continue;
+
+        const payload = t.item
+          ? buildSingleKitchenItemPayload(json, block, t.item)
+          : buildKitchenPayload(json, block);
+
+        for (let i = 0; i < copies; i++) {
+          await printToSingleNetProfile(t.profile, payload, tag);
+        }
+      }
+    }
+
+    return { handled: true, matched: true };
+  }
+
+  // ---------- Legacy single-LAN connect/print ----------
   const connectNetwork = async () => {
     if (!host) return Alert.alert('IP required', 'Enter the printer IP (e.g. 192.168.0.100).');
     try {
       setBusy(true);
       const p = Number(port) || 9100;
-      await appendLog(`[NET] connect to ${host}:${p}`);
       await lan.init();
-
       await lan.connect({ host, port: p });
-
-      try {
-        await appendLog('[NET] smoke test "NET OK"');
-        await lan.printText('NET OK\n', {} as any);
-      } catch (e) {
-        await appendLog(`[NET] smoke test FAILED: ${errMsg(e)}`);
-        throw new Error(`Connected, but cannot print. Check IP/port or firewall.\n${errMsg(e)}`);
-      }
-
+      try { await lan.printText('NET OK\n', {} as any); } catch {}
       setLanConnected(true);
       setActiveTransport('lan');
       await writePrefs({ ip: host.trim(), port: p });
       await mirrorPrefsToPublic();
-      await appendLog('[NET] connected & prefs saved');
       Alert.alert('Network', `Connected to ${host}:${p}`);
     } catch (e) {
-      await appendLog(`[NET] connect ERROR: ${errMsg(e)}`);
       setLanConnected(false);
       if (activeTransport === 'lan') setActiveTransport(null);
       Alert.alert('Network', errMsg(e) || 'Failed to connect.');
@@ -214,68 +436,83 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       setBusy(false);
     }
   };
-
   const disconnectNetwork = async () => {
     try {
       setBusy(true);
-      await appendLog('[NET] disconnect requested');
       await lan.disconnect?.();
-      await appendLog('[NET] disconnected');
-    } catch (e) {
-      await appendLog(`[NET] disconnect ERROR: ${errMsg(e)}`);
-    } finally {
+    } catch {}
+    finally {
       setBusy(false);
       setLanConnected(false);
       if (activeTransport === 'lan') setActiveTransport(null);
     }
   };
 
-  // ---- LAN PRINT: reconnect each job + retry once
+  // ---------- Network "Print Demo" (routes via saved printers first) ----------
   const printReceiptLan = async () => {
-    if (!host) return Alert.alert('Connect first', 'Enter the printer IP address.');
-    const p = Number(port) || 9100;
-
+    const tag = '[DEMO][NET]';
     try {
       setBusy(true);
-      await appendLog(`[NET] printReceipt START -> reconnect ${host}:${p}`);
 
+      if (enableMultiNet && savedPrinters.length > 0) {
+        await appendLog(`${tag} attempting saved-printer routing using ip_address in JSON`);
+        const res = await handleMultiLanPrint(receiptJson as any, tag);
+        if (res.handled) {
+          if (res.matched) {
+            await appendLog(`${tag} saved-printer routing: printed to matched target(s)`);
+            setLanConnected(true);
+          } else {
+            await appendLog(`${tag} saved-printer routing: no match -> blocking fallback (no print)`);
+          }
+          return; // do not fallback in either case
+        }
+        await appendLog(`${tag} no ip_address targeting in JSON -> using legacy single-LAN`);
+      } else {
+        await appendLog(`${tag} saved-printer routing disabled or no printers saved -> using legacy single-LAN`);
+      }
+
+      // Fallback to legacy single-host print (full receipt)
+      const legacyHost = host.trim();
+      const legacyPort = Number(port) || 9100;
+      if (!legacyHost) {
+        await appendLog(`${tag} legacy fallback aborted: no IP set`);
+        Alert.alert('Network', 'No saved match and no legacy IP set.');
+        return;
+      }
+
+      await appendLog(`${tag} [default-route] connect ${legacyHost}:${legacyPort}`);
       await lan.init();
-      await lan.connect({ host, port: p });
-
-      try {
-        await appendLog('[NET] smoke test "NET OK"');
-        await lan.printText('NET OK\n', {} as any);
-      } catch (e) {
-        await appendLog(`[NET] smoke test failed (continuing): ${errMsg(e)}`);
-      }
+      await lan.connect({ host: legacyHost, port: legacyPort });
 
       try {
         await renderReceipt(receiptJson as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+        await appendLog(`${tag} [default-route] printed to ${legacyHost}:${legacyPort}`);
       } catch (e) {
-        await appendLog('[NET] first print failed; reconnect & retry once');
+        await appendLog(`${tag} [default-route] first try failed, retrying once: ${errMsg(e)}`);
         await lan.init();
-        await lan.connect({ host, port: p });
+        await lan.connect({ host: legacyHost, port: legacyPort });
         await renderReceipt(receiptJson as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+        await appendLog(`${tag} [default-route] printed (retry) to ${legacyHost}:${legacyPort}`);
       }
-
-      await appendLog('[NET] printReceipt DONE');
       setLanConnected(true);
     } catch (e) {
-      await appendLog(`[NET] print ERROR: ${errMsg(e)}`);
+      await appendLog(`${tag} ERROR: ${errMsg(e)}`);
       Alert.alert('Print', errMsg(e) || 'Failed to print receipt over network.');
     } finally {
       setBusy(false);
     }
   };
 
-  // ---------- Boot: prefill + one-time auto-reconnect ----------
+  // ---------- Boot ----------
   useEffect(() => {
     let cancelled = false;
     const boot = async () => {
       if (cancelled) return;
-
       const prefs = await readPrefs();
-      await appendLog(`[BOOT] prefs ip=${prefs?.ip || ''} port=${prefs?.port || ''} bt=${prefs?.btAddress || ''}`);
+      const multi = await getEnableMultiNet();
+      const printers = await getNetPrinters();
+      setEnableMultiNetUI(!!multi);
+      setSavedPrinters(printers);
 
       if (prefs.ip) { setHost(prefs.ip); setPort(String(prefs.port ?? 9100)); }
       if (prefs.btAddress) { setBleDevice({ name: prefs.btName || prefs.btAddress, mac: prefs.btAddress }); }
@@ -283,35 +520,21 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       if (prefs.ip && !lanConnected && !triedNetOnce.current) {
         triedNetOnce.current = true;
         try {
-          await appendLog('[BOOT] try auto NET reconnect');
           await lan.init();
           await lan.connect({ host: prefs.ip, port: prefs.port || 9100 });
-          try {
-            await lan.printText('NET OK\n', {} as any);
-            setLanConnected(true);
-            setActiveTransport((t) => t ?? 'lan');
-            await appendLog('[BOOT] NET auto reconnect OK');
-          } catch (e) {
-            await appendLog(`[BOOT] NET smoketest fail: ${errMsg(e)}`);
-          }
-        } catch (e) {
-          await appendLog(`[BOOT] NET reconnect ERROR: ${errMsg(e)}`);
-        }
+          setLanConnected(true);
+          setActiveTransport((t) => t ?? 'lan');
+        } catch {}
       }
-
       if (prefs.btAddress && !bleConnected && !triedBleOnce.current) {
         triedBleOnce.current = true;
         if (!(await ensureBtPerms())) return;
         try {
-          await appendLog('[BOOT] try auto BLE reconnect');
           await ble.init();
           await ble.connect(prefs.btAddress);
           setBleConnected(true);
           setActiveTransport((t) => t ?? 'ble');
-          await appendLog('[BOOT] BLE auto reconnect OK');
-        } catch (e) {
-          await appendLog(`[BOOT] BLE reconnect ERROR: ${errMsg(e)}`);
-        }
+        } catch {}
       }
     };
     boot();
@@ -319,73 +542,71 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---------- AppState: one-time reconnect attempts ----------
+  // ---------- AppState refresh ----------
   useEffect(() => {
     const sub = AppState.addEventListener('change', async (state) => {
       if (state !== 'active') return;
-      await appendLog('[APPSTATE] active; try one-time reconnects');
-
       const prefs = await readPrefs();
+      const multi = await getEnableMultiNet();
+      const printers = await getNetPrinters();
+      setEnableMultiNetUI(!!multi);
+      setSavedPrinters(printers);
 
       if (prefs.ip && !lanConnected && !triedNetOnce.current) {
         triedNetOnce.current = true;
         try {
-          await appendLog('[APPSTATE] try NET reconnect');
           await lan.init();
           await lan.connect({ host: prefs.ip, port: prefs.port || 9100 });
-          try {
-            await lan.printText('NET OK\n', {} as any);
-            setLanConnected(true);
-            setActiveTransport((t) => t ?? 'lan');
-            await appendLog('[APPSTATE] NET reconnect OK');
-          } catch (e) {
-            await appendLog(`[APPSTATE] NET smoketest fail: ${errMsg(e)}`);
-          }
-        } catch (e) {
-          await appendLog(`[APPSTATE] NET reconnect ERROR: ${errMsg(e)}`);
-        }
+          setLanConnected(true);
+          setActiveTransport((t) => t ?? 'lan');
+        } catch {}
       }
-
       if (prefs.btAddress && !bleConnected && !triedBleOnce.current) {
         triedBleOnce.current = true;
         if (!(await ensureBtPerms())) return;
         try {
-          await appendLog('[APPSTATE] try BLE reconnect');
           await ble.init();
           await ble.connect(prefs.btAddress);
           setBleConnected(true);
           setActiveTransport((t) => t ?? 'ble');
-          await appendLog('[APPSTATE] BLE reconnect OK');
-        } catch (e) {
-          await appendLog(`[APPSTATE] BLE reconnect ERROR: ${errMsg(e)}`);
-        }
+        } catch {}
       }
     });
     return () => sub.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bleConnected, lanConnected]);
 
-  // ---------- PRINT_JSON event routing ----------
+  // ---------- PRINT_JSON router ----------
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener('PRINT_JSON', async (json) => {
+      const tag = '[EVENT]';
       try {
-        await appendLog(`[EVENT] PRINT_JSON (active=${activeTransport})`);
+        if (enableMultiNet && savedPrinters.length > 0) {
+          await appendLog(`${tag} attempting saved-printer routing using ip_address in JSON`);
+          const res = await handleMultiLanPrint(json, tag);
+          if (res.handled) {
+            if (res.matched) {
+              await appendLog(`${tag} saved-printer routing: printed to matched target(s)`);
+            } else {
+              await appendLog(`${tag} saved-printer routing: no match -> blocking fallback (no print)`);
+            }
+            return;
+          }
+          await appendLog(`${tag} no ip_address targeting in JSON -> considering fallback`);
+        }
+
         if (activeTransport === 'ble' && bleDevice?.mac) {
           if (!(await ensureBtPerms())) {
-            await appendLog('[EVENT][BLE] missing permissions');
             Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
             return;
           }
           try { await ble.disconnect?.(); } catch {}
-
           const session = new BLEPrinterService();
           await session.init();
           await session.connect(bleDevice.mac);
-
           try {
             await renderReceipt(json as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-          } catch (e) {
-            await appendLog('[EVENT][BLE] first attempt failed; recreate session & retry once');
+          } catch {
             try { await session.disconnect?.(); } catch {}
             const session2 = new BLEPrinterService();
             await session2.init();
@@ -393,34 +614,37 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
             await renderReceipt(json as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
             try { await session2.disconnect?.(); } catch {}
           }
-
           await sleep(150);
           try { await session.disconnect?.(); } catch {}
           setBleConnected(true);
-        } else if (activeTransport === 'lan' && host) {
+          return;
+        }
+
+        if (activeTransport === 'lan' && host) {
           const p = Number(port) || 9100;
+          await appendLog(`${tag} [default-route] event fallback to ${host}:${p}`);
           await lan.init();
           await lan.connect({ host, port: p });
           try {
             await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-          } catch (e) {
-            await appendLog('[EVENT][NET] first attempt failed; reconnect & retry once');
+          } catch {
             await lan.init();
             await lan.connect({ host, port: p });
             await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
           }
           setLanConnected(true);
-        } else {
-          await appendLog('[EVENT] no transport connected — alerting user');
-          Alert.alert('No printer connected', 'Connect Bluetooth or Network printer first.');
+          return;
         }
+
+        await appendLog(`${tag} no transport connected — alerting user`);
+        Alert.alert('No printer connected', 'Connect Bluetooth or Network printer first.');
       } catch (err) {
-        await appendLog(`[EVENT] PRINT_JSON ERROR: ${errMsg(err)}`);
+        await appendLog(`${tag} ERROR: ${errMsg(err)}`);
         Alert.alert('Print error', errMsg(err));
       }
     });
     return () => sub.remove?.();
-  }, [activeTransport, bleConnected, lanConnected, host, port, bleDevice?.mac]);
+  }, [activeTransport, bleConnected, lanConnected, host, port, bleDevice?.mac, enableMultiNet, savedPrinters]);
 
   // ---------- UI ----------
   return (
@@ -432,7 +656,6 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       <View style={styles.section}>
         <Text style={styles.label}>Select Device</Text>
 
-        {/* Underlined select (flat) */}
         <TouchableOpacity style={styles.selectUnderline} onPress={openDevicePicker}>
           <Text style={styles.selectText}>
             {bleDevice ? `${bleDevice.name} (${bleDevice.mac.slice(0, 8)}…)` : 'Choose a device'}
@@ -445,7 +668,7 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
             <TouchableOpacity
               style={styles.pill}
               onPress={async () => {
-                try { setBusy(true); await appendLog('[BLE] manual disconnect'); await ble.disconnect?.(); } catch {}
+                try { setBusy(true); await ble.disconnect?.(); } catch {}
                 finally { setBusy(false); }
                 setBleConnected(false);
                 if (activeTransport === 'ble') setActiveTransport(null);
@@ -547,7 +770,81 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
         )}
       </View>
 
-      {/* Device picker modal */}
+      {/* Divider */}
+      <View style={styles.divider} />
+
+      {/* MULTI-LAN */}
+      <Text style={[styles.h1, { marginTop: 8 }]}>Multi Network Printers</Text>
+      <View style={styles.section}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.label}>Enable Multi-Network Printing</Text>
+          <Switch value={enableMultiNet} onValueChange={async (v) => { setEnableMultiNetUI(v); await setEnableMultiNet(v); }} />
+        </View>
+
+        <View style={{ height: 8 }} />
+
+        <TouchableOpacity
+          style={[styles.pill, !enableMultiNet && styles.pillDisabled]}
+          onPress={() => enableMultiNet ? setAddModal(true) : Alert.alert('Enable Multi-Network', 'Turn on the toggle first.')}
+          disabled={!enableMultiNet}
+        >
+          <Text style={[styles.pillText, !enableMultiNet && styles.pillTextDisabled]}>
+            + Add Network Printer
+          </Text>
+        </TouchableOpacity>
+
+        {savedPrinters.length === 0 ? (
+          <Text style={styles.statusMuted}>No saved network printers.</Text>
+        ) : (
+          <View>
+            {savedPrinters.map((p, idx) => {
+              const portShown = (typeof p.port === 'number' && p.port > 0) ? p.port : DEFAULT_NET_PORT;
+              return (
+                <View key={`${p.host}:${portShown}:${idx}`} style={styles.cardRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontWeight: '700', color: '#111827' }}>
+                      {p.host}:{portShown}
+                    </Text>
+                  </View>
+
+                  <TouchableOpacity
+                    style={styles.btnMini}
+                    onPress={() => {
+                      setEditIndex(idx);
+                      setEditIp(p.host || '');
+                      setEditPort(String(portShown));
+                      setEditModal(true);
+                    }}
+                  >
+                    <Text style={styles.btnMiniText}>Edit</Text>
+                  </TouchableOpacity>
+
+                  <View style={{ width: 6 }} />
+                  <TouchableOpacity
+                    style={[styles.btnMini, { backgroundColor: '#FFF5F5', borderColor: '#FEE2E2' }]}
+                    onPress={async () => {
+                      Alert.alert('Delete', `Remove ${p.host}:${portShown}?`, [
+                        { text: 'Cancel' },
+                        {
+                          text: 'Delete', style: 'destructive', onPress: async () => {
+                            const next = savedPrinters.filter((x, i) => i !== idx);
+                            setSavedPrinters(next);
+                            await setNetPrinters(next);
+                          }
+                        },
+                      ]);
+                    }}
+                  >
+                    <Text style={[styles.btnMiniText, { color: RED }]}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              );
+            })}
+          </View>
+        )}
+      </View>
+
+      {/* BLE picker */}
       <Modal visible={pickerVisible} transparent animationType="fade" onRequestClose={() => setPickerVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
@@ -570,73 +867,172 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
           </View>
         </View>
       </Modal>
+
+      {/* Add Network Printer */}
+      <Modal visible={addModal} transparent animationType="fade" onRequestClose={() => setAddModal(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={[styles.h1, { marginBottom: 8 }]}>Add Network Printer</Text>
+
+            <Text style={styles.label}>IP Address</Text>
+            <TextInput
+              placeholder="192.168.1.104"
+              value={newIp}
+              onChangeText={setNewIp}
+              autoCapitalize="none"
+              keyboardType="numbers-and-punctuation"
+              style={styles.inputUnderline}
+              placeholderTextColor="#9CA3AF"
+            />
+
+            <Text style={styles.label}>Port</Text>
+            <TextInput
+              placeholder="9100"
+              value={newPort}
+              onChangeText={setNewPort}
+              keyboardType="number-pad"
+              style={styles.inputUnderline}
+              placeholderTextColor="#9CA3AF"
+            />
+
+            <View style={{ height: 12 }} />
+
+            <View style={styles.rowBetween}>
+              <TouchableOpacity
+                style={[styles.pill, { flex: 1, marginRight: 8 }]}
+                onPress={async () => {
+                  const ip = newIp.trim();
+                  if (!ip) return Alert.alert('Validation', 'Enter IP address (e.g., 192.168.1.104)');
+                  const p = Number(newPort) || DEFAULT_NET_PORT;
+                  const next = (() => {
+                    const idx = savedPrinters.findIndex(x => x.host === ip && (x.port || DEFAULT_NET_PORT) === p);
+                    const n = [...savedPrinters];
+                    if (idx >= 0) n[idx] = { ...n[idx], host: ip, port: p };
+                    else n.push({ name: ip, host: ip, port: p });
+                    return n;
+                  })();
+                  setSavedPrinters(next);
+                  await setNetPrinters(next);
+                  setNewIp('');
+                  setNewPort(String(DEFAULT_NET_PORT));
+                  setAddModal(false);
+                }}
+              >
+                <Text style={styles.pillText}>Save</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.pill, { flex: 1 }]} onPress={() => setAddModal(false)}>
+                <Text style={styles.pillText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Edit Network Printer */}
+      <Modal visible={editModal} transparent animationType="fade" onRequestClose={() => setEditModal(false)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={[styles.h1, { marginBottom: 8 }]}>Edit Network Printer</Text>
+
+            <Text style={styles.label}>IP Address</Text>
+            <TextInput
+              placeholder="192.168.1.104"
+              value={editIp}
+              onChangeText={setEditIp}
+              autoCapitalize="none"
+              keyboardType="numbers-and-punctuation"
+              style={styles.inputUnderline}
+              placeholderTextColor="#9CA3AF"
+            />
+
+            <Text style={styles.label}>Port</Text>
+            <TextInput
+              placeholder="9100"
+              value={editPort}
+              onChangeText={setEditPort}
+              keyboardType="number-pad"
+              style={styles.inputUnderline}
+              placeholderTextColor="#9CA3AF"
+            />
+
+            <View style={{ height: 12 }} />
+
+            <View style={styles.rowBetween}>
+              <TouchableOpacity
+                style={[styles.pill, { flex: 1, marginRight: 8 }]}
+                onPress={async () => {
+                  if (editIndex === null) return setEditModal(false);
+                  const ip = editIp.trim();
+                  if (!ip) return Alert.alert('Validation', 'Enter IP address (e.g., 192.168.1.104)');
+                  const p = Number(editPort) || DEFAULT_NET_PORT;
+
+                  const next = [...savedPrinters];
+                  next[editIndex] = { ...next[editIndex], host: ip, port: p };
+                  setSavedPrinters(next);
+                  await setNetPrinters(next);
+
+                  setEditModal(false);
+                  setEditIndex(null);
+                }}
+              >
+                <Text style={styles.pillText}>Save</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.pill, { flex: 1 }]}
+                onPress={() => {
+                  setEditModal(false);
+                  setEditIndex(null);
+                }}
+              >
+                <Text style={styles.pillText}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </DrawerContentScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   scroll: { padding: 16, backgroundColor: '#FAFAFA' },
-
   h1: { fontSize: 18, fontWeight: '700', marginBottom: 10, color: '#111827' },
-
-  // flat section (no card box)
-  section: {
-    paddingVertical: 6,
-  },
-
-  // thin divider between sections
-  divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: '#E5E7EB',
-    marginVertical: 12,
-  },
-
+  section: { paddingVertical: 6 },
+  divider: { height: StyleSheet.hairlineWidth, backgroundColor: '#E5E7EB', marginVertical: 12 },
   label: { fontSize: 12, color: SUBTLE, marginBottom: 6 },
-
-  // underlined "select" (dropdown) field
   selectUnderline: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: BORDER,
-    marginBottom: 16,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER, marginBottom: 16,
   },
   selectText: { fontSize: 14, color: '#111827' },
-
-  // underlined inputs
   inputUnderline: {
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: BORDER,
-    marginBottom: 16,
-    fontSize: 14,
-    color: '#111827',
-    backgroundColor: 'transparent',
+    paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: BORDER,
+    marginBottom: 16, fontSize: 14, color: '#111827', backgroundColor: 'transparent',
   },
-
-  // pills (kept)
   pill: {
-    backgroundColor: '#F5F1FF',
-    borderRadius: 26,
-    paddingVertical: 12,
-    alignItems: 'center',
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#E2DAFF',
+    backgroundColor: '#F5F1FF', borderRadius: 26, paddingVertical: 12,
+    alignItems: 'center', marginBottom: 12, borderWidth: 1, borderColor: '#E2DAFF',
   },
   pillText: { color: PRIMARY, fontWeight: '700' },
-
   pillDisabled: { backgroundColor: DISABLED_BG, borderColor: '#E6E2F5' },
   pillTextDisabled: { color: DISABLED_TXT },
-
   statusOk: { marginTop: 6, color: '#111827' },
   statusMuted: { marginTop: 6, color: '#9CA3AF' },
-
   modalOverlay: {
     flex: 1, backgroundColor: 'rgba(0,0,0,0.25)', alignItems: 'center', justifyContent: 'center',
   },
   modalCard: { width: '86%', backgroundColor: '#fff', borderRadius: 16, padding: 16 },
   deviceRow: { paddingVertical: 10, borderBottomColor: '#EEE', borderBottomWidth: 1 },
+  rowBetween: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  cardRow: {
+    flexDirection: 'row', alignItems: 'center',
+    borderWidth: 1, borderColor: BORDER, borderRadius: 12,
+    padding: 10, marginBottom: 10, backgroundColor: '#FFFFFF',
+  },
+  btnMini: {
+    paddingVertical: 6, paddingHorizontal: 10,
+    borderWidth: 1, borderColor: '#E2DAFF',
+    borderRadius: 10, backgroundColor: '#F5F1FF',
+  },
+  btnMiniText: { color: PRIMARY, fontWeight: '700', fontSize: 12 },
 });

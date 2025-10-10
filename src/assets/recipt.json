@@ -1,0 +1,186 @@
+{
+  "printer_name": ["EPSON TM-T81 Receipt"],
+  "item_length": "35",
+  "template": "1",
+  "data": [
+    {
+      "type": "logo",
+      "data": {
+        "url": "https://app1.esmartpos.com/./assets/POS/logo/logo_for_printers/82845e644c93dbfc125901aae7f31f9a_bw.jpg"
+      }
+    },
+    {
+      "type": "kitchenlogo",
+      "data": {
+        "url": "",
+        "y_axis": 10,
+        "x_axis": 10,
+        "logo_width": 150,
+        "logo_height": 100
+      }
+    },
+    {
+      "type": "header",
+      "data": {
+        "top_title": "Aquation Restaurant",
+        "sub_titles": [
+          "Koh Pich Street, Diamond Island, Phnom Penh",
+          "0967452713",
+          "Takeaway"
+        ],
+        "address": [
+          "Koh Pich Street, Diamond Island Sangkat Tonle Bassac, Khan Chamkarmorn, Phnom Penh"
+        ],
+        "bill_no": "",
+        "ticket_no": "",
+        "date_of_bill": "",
+        "prepration_date": "",
+        "time": "11:19",
+        "print": "",
+        "table": "",
+        "online_order_id": "",
+        "employee": "",
+        "till": "",
+        "order_type": "",
+        "customer_name": "",
+        "customer_phone": "",
+        "customer_address": [],
+        "customer_remarks": [],
+        "split_bill_string": "",
+        "headercomments": []
+      }
+    },
+    {
+      "type": "footer",
+      "data": {
+        "align": "left",
+        "footer_text": [
+          "Invoice/Bill No: AQR-T-000001",
+          "Customer Name: Walk In",
+          "Phone No: 0000000000001",
+          "Cust Address:",
+          "Sales Ast: Karl_Diederich",
+          "Date: 07/07/2022 11:19"
+        ]
+      }
+    },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
+    {
+      "type": "item",
+      "data": {
+        "itemdata": [
+          {
+            "item_amount": "80.00",
+            "item_name": "Sweet Potatoes Pancakes (2)",
+            "item_subLine": "",
+            "toppings_with_price": [],
+            "toppings": [],
+            "quantity": "1",
+            "selected": false,
+            "price": "0.00",
+            "items": [],
+            "custpmer_remarks": "",
+            "printer_name": "",
+            "printer_label": "",
+            "station": "",
+            "0": false,
+            "deleted": false,
+            "exists": false,
+            "display_index": "0",
+            "is_printed": false,
+            "made_to": false,
+            "menu_group": "",
+            "kitchen_print": false
+          }
+        ]
+      }
+    },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
+    {
+      "type": "bigsummary",
+      "data": {
+        "bigsummary": [
+          { "key": "Total Item(s):1", "value": "", "fontwidth": "1" },
+          { "key": "Subtotal", "value": "3.00", "fontwidth": "1" },
+          { "key": "Grand Total", "value": "3.00", "fontwidth": "1" }
+        ]
+      }
+    },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
+    {
+      "type": "summary",
+      "data": {
+        "summary": [
+          { "key": "Subtotal", "value": "3.00" }
+        ]
+      }
+    },
+    {
+      "type": "setting",
+      "data": {
+        "printer_name": ["Cashier"],
+        "print_type": "",
+        "item_length": 30,
+        "print_logo": false,
+        "thankyou_note": "",
+        "thankyou_note2": "",
+        "printer_type": "POS"
+      }
+    },
+    {
+      "type": "columndetails",
+      "data": {
+        "columnheader": { "column1": "Tax", "column2": "", "column3": "", "column4": "tax" },
+        "columndata": [
+          { "column1": "", "column2": "", "column3": "", "column4": "" }
+        ]
+      }
+    },
+    {
+      "type": "Receipt",
+      "data": { "receipt_text": ["Payment Type : "] }
+    },
+    {
+      "type": "kitchen_print",
+      "ip_address": "192.168.1.104",
+      "individual_print": "0",
+      "data": {
+        "itemdata": [
+          {
+            "item_amount": "3.00",
+            "item_name": "Khmer chicken porridge ",
+            "item_subLine": "",
+            "toppings_with_price": [],
+            "toppings": ["Prawns"],
+            "quantity": "1",
+            "selected": false,
+            "price": "44.99",
+            "custpmer_remarks": "Testtng",
+            "printer_name": "XP-80",
+            "printer_label": "Testtng 3",
+            "station": "",
+            "food_stampable": "yes",
+            "items": [],
+            "print_description": "",
+            "deleted": false,
+            "exists": false,
+            "display_index": "0",
+            "is_printed": false,
+            "made_to": false,
+            "menu_group": "Combo~10",
+            "kitchen_print": false
+          }
+        ]
+      }
+    }
+  ]
+}

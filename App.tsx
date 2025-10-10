@@ -23,8 +23,7 @@ import WebView from 'react-native-webview';
 import DrawerContent from './src/screens/DrawerContent';
 import { readPrefs, writePrefs } from './src/services/prefs';
 
-// 🔹 NEW: logger (writes logs to Internal storage/Download/Techsapphire/app.log
-// and mirrors prefs to Internal storage/Download/Techsapphire/printer_prefs.json)
+// 🔹 logger
 import {
   hookConsoleToFile,
   mirrorPrefsToPublic,
@@ -40,6 +39,38 @@ console.log('Prefs copy:', PREF_PUBLIC_PATH);
 
 const Drawer = createDrawerNavigator();
 const { version: APP_VERSION } = require('./package.json');
+
+/* ============================================================
+   HARD-CODED IP FALLBACK (DISABLED)
+   Previously used to inject IPs when JSON lacked ip_address.
+   Per your request, we're **commenting this out**.
+============================================================ */
+// const HARDCODED_IPS = ['192.168.1.104'];
+
+/* Helpers: detect if JSON already carries any ip_address targets */
+
+/** Checks ALL kitchen_print blocks (and setting) for ip_address presence */
+function hasIpTargets(p: any): boolean {
+  const blocks = Array.isArray(p?.data) ? p.data : [];
+
+  // cashier (setting)
+  const setting = blocks.find((b: any) => b?.type === 'setting');
+  const sVal = setting?.data?.ip_address;
+  const hasCashier =
+    (Array.isArray(sVal) && sVal.length > 0) ||
+    (typeof sVal === 'string' && sVal.trim() !== '');
+
+  // all kitchens
+  const kitchenBlocks = blocks.filter((b: any) => b?.type === 'kitchen_print');
+  const hasAnyKitchen = kitchenBlocks.some((k: any) => {
+    const v = k?.ip_address ?? k?.data?.ip_address;
+    return (Array.isArray(v) && v.length > 0) || (typeof v === 'string' && v.trim() !== '');
+  });
+
+  return hasCashier || hasAnyKitchen;
+}
+
+/* NOTE: The old injectHardcodedIps(...) helper has been removed on purpose. */
 
 // ---------------- Home (WebView host) ----------------
 function HomeScreen({
@@ -124,7 +155,6 @@ export default function App() {
   }, []);
 
   const openSearch = () => {
-    // Optional: prefill modal with current page
     setUrlText(webUrl || urlText);
     setUrlModalVisible(true);
   };
@@ -155,7 +185,13 @@ export default function App() {
         const txt = await res.text();
         let payload: any = txt;
         try { payload = JSON.parse(txt); } catch {}
-        DeviceEventEmitter.emit('PRINT_JSON', payload); // DrawerContent listens and prints
+
+        // 🔸 LOG ONLY when JSON has no ip_address — do NOT inject fallback IPs
+        if (!hasIpTargets(payload)) {
+          console.log('[WebView] No ip_address found in JSON (remote fetch). Printing will be skipped unless a default route exists.');
+        }
+
+        DeviceEventEmitter.emit('PRINT_JSON', payload); // DrawerContent will handle routing/matching
         return;
       }
 
@@ -172,6 +208,12 @@ export default function App() {
           }
         }
       }
+
+      // 🔸 LOG ONLY when JSON has no ip_address — do NOT inject fallback IPs
+      if (!hasIpTargets(payload)) {
+        console.log('[WebView] No ip_address found in JSON (direct message). Printing will be skipped unless a default route exists.');
+      }
+
       DeviceEventEmitter.emit('PRINT_JSON', payload);
     } catch (err: any) {
       Alert.alert('Print Error', err?.message || String(err));

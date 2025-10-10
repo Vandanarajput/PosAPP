@@ -15,7 +15,7 @@ export type RenderOptions = { widthDots: number; logoScale?: number };
 export type ReceiptJSON = {
   item_length?: number | string;
   thankYou?: string;
-  data: Array<{ type: string; data: any }>;
+  data: Array<{ type: string; data?: any; [k: string]: any }>;
 };
 
 // ---------- helpers ----------
@@ -84,7 +84,7 @@ function computeCols(total: number) {
   const qty = 4;
   const price = 7;
   const amount = 8;
-  const gaps = 3;
+  const gaps = 4;
   const item = Math.max(8, total - (qty + price + amount + gaps));
   return { item, qty, price, amount };
 }
@@ -93,7 +93,7 @@ function computeCols(total: number) {
 const ITEM_NAME_WRAP = 30;
 
 // ---------- NEW: totals aligned to the same "Amount" column ----------
-const AMOUNT_GAP = 3; // increase for a bigger space between label and number
+const AMOUNT_GAP = 2; // increase for a bigger space between label and number
 
 function amountAlignedRow(label: string, value: string | number, width: number) {
   const cols = computeCols(width);
@@ -102,6 +102,15 @@ function amountAlignedRow(label: string, value: string | number, width: number) 
   const labelText = String(label ?? '');
   const valueText = String(value ?? '');
   return rpad(labelText, leftW) + ' '.repeat(gap) + rAlign(valueText, cols.amount);
+}
+
+// ✅ NEW helper: center each non-empty line by inlining CENTER into the same string.
+//    Many printer SDKs reset alignment on each printText() call, so we don't rely on state.
+function centerBlock(text: string) {
+  return text
+    .split('\n')
+    .map(l => (l ? `${CENTER}${l}` : ''))
+    .join('\n');
 }
 
 // ---------- device state (optional, only if raw supported) ----------
@@ -163,6 +172,85 @@ function getCharWidth(json: ReceiptJSON) {
   return clamp(w, 24, 64);
 }
 
+// ---------- NEW: kitchen helpers ----------
+function getKitchenBlockIfOnly(payload: ReceiptJSON) {
+  if (!Array.isArray(payload?.data)) return null;
+  if (payload.data.length !== 1) return null;
+  const b = payload.data[0];
+  return b?.type === 'kitchen_print' ? b : null;
+}
+
+function asKitchenItems(kb: any): any[] {
+  const arr = kb?.data?.itemdata;
+  return Array.isArray(arr) ? arr : [];
+}
+
+function asLines(v: any): string[] {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.map(String).filter(Boolean);
+  if (typeof v === 'string') return [v];
+  return [];
+}
+
+async function renderKitchenTicket(
+  kitchenBlock: any,
+  transport: PrinterTransport,
+  width: number
+) {
+  const TAG = '[kitchen]';
+  console.log(`${TAG} render start`);
+
+  // Title
+  await transport.printText(`${CENTER}*** KITCHEN ***\n`, {} as any);
+
+  // Optional: dump minimal header info if present in the same block (rare)
+  const headerLines = asLines(kitchenBlock?.header_text);
+  for (const ln of headerLines) {
+    await transport.printText(`${CENTER}${ln}\n`, {} as any);
+  }
+
+  // Divider
+  await transport.printText(LEFT, {} as any);
+  await transport.printText(`${hr(width)}\n`, {} as any);
+
+  // Items
+  const items = asKitchenItems(kitchenBlock);
+  if (!items.length) {
+    await transport.printText('(No items)\n', {} as any);
+  } else {
+    for (const it of items) {
+      const qty = toInt(it?.quantity, 1);
+      const name = String(it?.item_name ?? '').trim();
+      const row = `${qty} x ${name}`;
+      await transport.printText(`${row}\n`, { bold: true } as any);
+
+      // toppings
+      const tops = Array.isArray(it?.toppings) ? it.toppings : [];
+      for (const t of tops) await transport.printText(`  • ${String(t)}\n`, {} as any);
+
+      // remarks
+      const cm = String(it?.custpmer_remarks ?? it?.customer_remarks ?? '').trim();
+      if (cm) await transport.printText(`  Remarks: ${cm}\n`, {} as any);
+
+      // spacer
+      await transport.printText('\n', {} as any);
+    }
+  }
+
+  // Divider + footer
+  await transport.printText(`${hr(width)}\n`, {} as any);
+  await transport.printText(`${CENTER}— Ticket End —\n`, {} as any);
+
+  // Cut
+  if (typeof (transport as any).cut === 'function') {
+    console.log(`${TAG} cut: using transport.cut('full')`);
+    await (transport as any).cut('full');
+  } else {
+    await autoCutSimple(transport);
+  }
+  console.log(`${TAG} render done`);
+}
+
 // ---------- MAIN (BATCHED) ----------
 export async function renderReceipt(
   receiptJson: ReceiptJSON,
@@ -175,6 +263,17 @@ export async function renderReceipt(
   const TAG = '[receipt]';
   const { widthDots, logoScale = 0.55 } = opts;
   const width = getCharWidth(receiptJson);
+
+  // === NEW: handle kitchen-only payloads early and return ===
+  const kitchenOnly = getKitchenBlockIfOnly(receiptJson);
+  if (kitchenOnly) {
+    // most kitchen routes send a single block payload { type: "kitchen_print", ... }
+    await saneState(transport);
+    await renderKitchenTicket(kitchenOnly, transport, width);
+    return;
+  }
+
+  // otherwise, continue with your existing full-receipt flow
   const { logoUrl, header, items, bigRows, sumRows, footers, thank } = parse(receiptJson);
 
   console.log(`${TAG} render start`, {
@@ -231,27 +330,27 @@ export async function renderReceipt(
       console.log(`${TAG} header: empty`);
     }
     // print a rule right under "Takeaway" — HARD LEFT to reset state
-    await transport.printText(LEFT, {} as any);
-    await transport.printText(`${hr(width)}\n`, {} as any);
+    await transport.printText('\n', {} as any);                           // flush/separate from header lines
+    await transport.printText(`${CENTER}${hr(width)}\n`, { bold: false } as any); // same style as other centered rules
+    await transport.printText(LEFT, {} as any); 
+
+    
   }
 
-  // 3) Items (stable, left-aligned grid)
+  // 3) Items (stable grid — NOW CENTERED for the whole block)
   {
     const cols = computeCols(width);
     console.log(`${TAG} items: columns`, cols);
 
     const buf: string[] = [];
 
-    // header: left overall, numeric columns right-aligned
+    // header line for the table
     const head =
       rpad('Item',  cols.item)  + ' ' +
       rAlign('Qty', cols.qty)   + ' ' +
       rAlign('Price', cols.price) + ' ' +
       rAlign('Amount', cols.amount);
     buf.push(head);
-
-    // dashed rule directly under the column header
-    buf.push(hr(width));
 
     for (let i = 0; i < items.length; i++) {
       const it = items[i];
@@ -272,7 +371,7 @@ export async function renderReceipt(
         rAlign(formatMoney(lineTotal), cols.amount);
       buf.push(row);
 
-      // wrapped continuation lines under Item column (keep other columns empty)
+      // wrapped continuation lines under Item column (other columns blank)
       for (const tail of lines) {
         buf.push(
           rpad(tail, cols.item) + ' ' +
@@ -296,16 +395,25 @@ export async function renderReceipt(
     }
 
     console.log(`${TAG} items: printing`, { lines: buf.length });
-    const itemsOut = buf.join('\n') + '\n';
 
-    // HARD LEFT before table & divider to cancel any lingering CENTER
+    // OLD build-and-left-print (kept for learning)
+    // const itemsOutOld = buf.join('\n') + '\n';
+    // await transport.printText(LEFT, {} as any);
+    // await transport.printText(itemsOutOld, {} as any);
+    // await transport.printText(LEFT, {} as any);
+    // await transport.printText(`${hr(width)}\n`, {} as any);
+
+    // ✅ NEW: inline CENTER into the same strings we print (SDKs often reset alignment per call)
+    const itemsOut = buf.join('\n'); // no trailing \n yet
+    const centeredItemsOut = centerBlock(itemsOut) + '\n';
+    await transport.printText(centeredItemsOut, {} as any);         // header + rows centered
+    await transport.printText(`${CENTER}${hr(width)}\n`, {} as any); // divider centered
+
+    // reset for next sections
     await transport.printText(LEFT, {} as any);
-    await transport.printText(itemsOut, {} as any);
-    await transport.printText(LEFT, {} as any);
-    await transport.printText(`${hr(width)}\n`, {} as any);
   }
 
-  // 4) Big summary (left aligned; align numbers to Amount column)
+  // 4) Big summary (Subtotal/Taxes/Grand Total) — NOW CENTERED
   {
     const lines: string[] = [];
     for (const r of bigRows) {
@@ -313,17 +421,26 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} bigSummary: printing`, { linesCount: lines.length });
-      const bigOut = lines.join('\n') + '\n';
-      await transport.printText(LEFT, {} as any);
-      await transport.printText(bigOut, {} as any);
-      await transport.printText(LEFT, {} as any);
-      await transport.printText(`${hr(width)}\n`, {} as any);
+
+      // OLD left-aligned (kept for learning)
+      // const bigOutOld = lines.join('\n') + '\n';
+      // await transport.printText(LEFT, {} as any);
+      // await transport.printText(bigOutOld, {} as any);
+      // await transport.printText(LEFT, {} as any);
+      // await transport.printText(`${hr(width)}\n`, {} as any);
+
+      // ✅ NEW: inline CENTER per line + centered divider
+      const bigOut = lines.join('\n');
+      await transport.printText(centerBlock(bigOut) + '\n', {} as any);
+      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+
+      await transport.printText(LEFT, {} as any); // reset
     } else {
       console.log(`${TAG} bigSummary: empty`);
     }
   }
 
-  // 5) Summary (Paid/Change…): single-line rows, left aligned
+  // 5) Summary (Paid Amount / Change) — NOW CENTERED
   {
     const lines: string[] = [];
     for (const r of sumRows) {
@@ -331,11 +448,20 @@ export async function renderReceipt(
     }
     if (lines.length) {
       console.log(`${TAG} summary: printing`, { linesCount: lines.length });
-      const sumOut = lines.join('\n') + '\n';
-      await transport.printText(LEFT, {} as any);
-      await transport.printText(sumOut, {} as any);
-      await transport.printText(LEFT, {} as any);
-      await transport.printText(`${hr(width)}\n`, {} as any);
+
+      // OLD left-aligned (kept for learning)
+      // const sumOutOld = lines.join('\n') + '\n';
+      // await transport.printText(LEFT, {} as any);
+      // await transport.printText(sumOutOld, {} as any);
+      // await transport.printText(LEFT, {} as any);
+      // await transport.printText(`${hr(width)}\n`, {} as any);
+
+      // ✅ NEW: inline CENTER per line + centered divider
+      const sumOut = lines.join('\n');
+      await transport.printText(centerBlock(sumOut) + '\n', {} as any);
+      await transport.printText(`${CENTER}${hr(width)}\n`, {} as any);
+
+      await transport.printText(LEFT, {} as any); // reset for footer/thanks
     } else {
       console.log(`${TAG} summary: empty`);
     }
