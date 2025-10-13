@@ -1,12 +1,12 @@
 {
   "printer_name": ["EPSON TM-T81 Receipt"],
-  "item_length": "35",
+  "item_length": 35,
   "template": "1",
   "data": [
     {
       "type": "logo",
       "data": {
-        "url": "https://app1.esmartpos.com/./assets/POS/logo/logo_for_printers/82845e644c93dbfc125901aae7f31f9a_bw.jpg"
+        "url": "https://dummyimage.com/576x160/ffffff/000.png&text=YOUR+LOGO"
       }
     },
     {

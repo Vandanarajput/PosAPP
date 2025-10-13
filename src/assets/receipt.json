@@ -22,6 +22,8 @@
         "time": "12:05"
       }
     },
+    { "type": "separator", "data": { "separator_length": "" } },
+
     {
       "type": "item",
       "data": {
@@ -43,6 +45,8 @@
         ]
       }
     },
+    { "type": "separator", "data": { "separator_length": "" } },
+
     {
       "type": "bigsummary",
       "data": {
@@ -54,6 +58,8 @@
         ]
       }
     },
+    { "type": "separator", "data": { "separator_length": "" } },
+
     {
       "type": "summary",
       "data": {
@@ -63,6 +69,8 @@
         ]
       }
     },
+    { "type": "separator", "data": { "separator_length": "" } },
+
     {
       "type": "footer",
       "data": {
