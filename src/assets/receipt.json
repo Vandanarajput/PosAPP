@@ -4,6 +4,40 @@
   "thankYou": "Thank you for your purchase!",
   "data": [
     {
+      "type": "kitchen_print",
+      "ip_address": "192.168.1.104",
+      "individual_print": "0",
+      "data": {
+        "itemdata": [
+          {
+            "item_amount": "18.00",
+            "item_name": "Salad ",
+            "item_subLine": "",
+            "toppings_with_price": [],
+            "toppings": ["3 X Cold", "3 X Egg", "3 X Side Dish"],
+            "quantity": "3",
+            "selected": false,
+            "price": "44.99",
+            "custpmer_remarks": "Testtng",
+            "printer_name": "80mm 114",
+            "printer_label": "Testtng 3",
+            "station": "",
+            "food_stampable": "yes",
+            "items": [],
+            "print_description": "test live",
+            "deleted": false,
+            "exists": false,
+            "display_index": "0",
+            "is_printed": false,
+            "made_to": false,
+            "menu_group": "Combo~10",
+            "kitchen_print": false
+          }
+        ]
+      }
+    },
+
+    {
       "type": "logo",
       "data": {
         "url": "https://dummyimage.com/576x160/ffffff/000.png&text=YOUR+LOGO"
@@ -22,7 +56,10 @@
         "time": "12:05"
       }
     },
-    { "type": "separator", "data": { "separator_length": "" } },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
 
     {
       "type": "item",
@@ -45,31 +82,40 @@
         ]
       }
     },
-    { "type": "separator", "data": { "separator_length": "" } },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
 
     {
       "type": "bigsummary",
       "data": {
         "bigsummary": [
-          { "key": "Subtotal",    "value": "190.00", "fontwidth": "1" },
-          { "key": "CGST (2.5%)", "value": "4.75",   "fontwidth": "1" },
-          { "key": "SGST (2.5%)", "value": "4.75",   "fontwidth": "1" },
+          { "key": "Subtotal", "value": "190.00", "fontwidth": "1" },
+          { "key": "CGST (2.5%)", "value": "4.75", "fontwidth": "1" },
+          { "key": "SGST (2.5%)", "value": "4.75", "fontwidth": "1" },
           { "key": "Grand Total", "value": "199.50", "fontwidth": "1" }
         ]
       }
     },
-    { "type": "separator", "data": { "separator_length": "" } },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
 
     {
       "type": "summary",
       "data": {
         "summary": [
           { "key": "Paid Amount", "value": "200.00" },
-          { "key": "Change",      "value": "0.50" }
+          { "key": "Change", "value": "0.50" }
         ]
       }
     },
-    { "type": "separator", "data": { "separator_length": "" } },
+    {
+      "type": "separator",
+      "data": { "separator_length": "" }
+    },
 
     {
       "type": "footer",
@@ -82,16 +128,10 @@
       "type": "footer",
       "data": {
         "align": "center",
-        "footer_text": ["Order# 1024  •  12:05 PM"]
-      }
-    },
-    {
-      "type": "footer",
-      "data": {
-        "align": "center",
         "footer_text": ["Powered by RNPrinter"]
       }
     },
+
     {
       "type": "setting",
       "data": {

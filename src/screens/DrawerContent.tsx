@@ -200,6 +200,17 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
   const ble = useMemo(() => new BLEPrinterService(), []);
   const lan = useMemo(() => new NetPrinterService(), []);
 
+  // ---- CHANGE: add a tiny print queue to serialize all prints ----
+  const printChainRef = useRef<Promise<void>>(Promise.resolve());
+  const enqueuePrint = (job: () => Promise<void>) => {
+    const next = printChainRef.current
+      .then(job)
+      .catch(() => {})   // keep chain alive on error
+      .then(() => {});
+    printChainRef.current = next;
+    return next;
+  };
+
   // ---------- BLE ----------
   const openDevicePicker = async () => {
     try {
@@ -243,35 +254,47 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
     }
   };
   const printReceiptBle = async () => {
-    if (!bleDevice?.mac) return Alert.alert('Select Device', 'Choose a Bluetooth printer first.');
-    try {
-      setBusy(true);
-      if (!(await ensureBtPerms())) {
-        Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
-        return;
-      }
-      try { await ble.disconnect?.(); } catch {}
-      const session = new BLEPrinterService();
-      await session.init();
-      await session.connect(bleDevice.mac);
+    await enqueuePrint(async () => {
+      if (!bleDevice?.mac) return Alert.alert('Select Device', 'Choose a Bluetooth printer first.');
       try {
-        await renderReceipt(receiptJson as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-      } catch {
+        setBusy(true);
+        if (!(await ensureBtPerms())) {
+          Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
+          return;
+        }
+        try { await ble.disconnect?.(); } catch {}
+        const session = new BLEPrinterService();
+        await session.init();
+        await session.connect(bleDevice.mac);
+
+        // === CHANGE: Bluetooth should NOT print kitchen_print blocks ===
+        const nonKitchenJson = {
+          ...(receiptJson as any),
+          data: ((receiptJson as any)?.data || []).filter(
+            (b: any) => String(b?.type).toLowerCase() !== 'kitchen_print'
+          ),
+        };
+        // ===============================================================
+
+        try {
+          await renderReceipt(nonKitchenJson as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+        } catch {
+          try { await session.disconnect?.(); } catch {}
+          const session2 = new BLEPrinterService();
+          await session2.init();
+          await session2.connect(bleDevice.mac);
+          await renderReceipt(nonKitchenJson as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+          try { await session2.disconnect?.(); } catch {}
+        }
+        await sleep(150);
         try { await session.disconnect?.(); } catch {}
-        const session2 = new BLEPrinterService();
-        await session2.init();
-        await session2.connect(bleDevice.mac);
-        await renderReceipt(receiptJson as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-        try { await session2.disconnect?.(); } catch {}
+        setBleConnected(true);
+      } catch (e) {
+        Alert.alert('Print', errMsg(e) || 'Failed to print receipt.');
+      } finally {
+        setBusy(false);
       }
-      await sleep(150);
-      try { await session.disconnect?.(); } catch {}
-      setBleConnected(true);
-    } catch (e) {
-      Alert.alert('Print', errMsg(e) || 'Failed to print receipt.');
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   // -------------- MULTI-LAN CORE --------------
@@ -428,6 +451,35 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       await writePrefs({ ip: host.trim(), port: p });
       await mirrorPrefsToPublic();
       Alert.alert('Network', `Connected to ${host}:${p}`);
+
+      // Print Kitchen ticket(s) automatically on connect (kept from your last request)
+      try {
+        const tag = '[CONNECT][NET]';
+        if (enableMultiNet && savedPrinters.length > 0) {
+          await appendLog(`${tag} attempting saved-printer routing on connect`);
+          const res = await handleMultiLanPrint(receiptJson as any, tag);
+          if (res.handled) { await appendLog(`${tag} saved-printer routing completed (matched=${res.matched})`); return; }
+          await appendLog(`${tag} no ip_address targeting in JSON -> fallback to legacy single-host kitchen print`);
+        }
+        const kb = (receiptJson as any)?.data?.find((b: any) => b?.type === 'kitchen_print');
+        if (kb) {
+          const individual = String(kb?.individual_print ?? '0') === '1';
+          if (individual) {
+            const items = kb?.data?.itemdata || [];
+            for (const it of items) {
+              const payload = buildSingleKitchenItemPayload(receiptJson as any, kb, it);
+              await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+              await sleep(120);
+            }
+          } else {
+            const payload = buildKitchenPayload(receiptJson as any, kb);
+            await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+          }
+        }
+      } catch (e) {
+        Alert.alert('Kitchen Print', errMsg(e) || 'Failed to print kitchen receipt.');
+      }
+
     } catch (e) {
       setLanConnected(false);
       if (activeTransport === 'lan') setActiveTransport(null);
@@ -448,59 +500,76 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
     }
   };
 
-  // ---------- Network "Print Demo" (routes via saved printers first) ----------
+  // ---------- Network "Print Demo" (NOW prints Kitchen-only) ----------
   const printReceiptLan = async () => {
-    const tag = '[DEMO][NET]';
-    try {
-      setBusy(true);
-
-      if (enableMultiNet && savedPrinters.length > 0) {
-        await appendLog(`${tag} attempting saved-printer routing using ip_address in JSON`);
-        const res = await handleMultiLanPrint(receiptJson as any, tag);
-        if (res.handled) {
-          if (res.matched) {
-            await appendLog(`${tag} saved-printer routing: printed to matched target(s)`);
-            setLanConnected(true);
-          } else {
-            await appendLog(`${tag} saved-printer routing: no match -> blocking fallback (no print)`);
-          }
-          return; // do not fallback in either case
-        }
-        await appendLog(`${tag} no ip_address targeting in JSON -> using legacy single-LAN`);
-      } else {
-        await appendLog(`${tag} saved-printer routing disabled or no printers saved -> using legacy single-LAN`);
-      }
-
-      // Fallback to legacy single-host print (full receipt)
-      const legacyHost = host.trim();
-      const legacyPort = Number(port) || 9100;
-      if (!legacyHost) {
-        await appendLog(`${tag} legacy fallback aborted: no IP set`);
-        Alert.alert('Network', 'No saved match and no legacy IP set.');
-        return;
-      }
-
-      await appendLog(`${tag} [default-route] connect ${legacyHost}:${legacyPort}`);
-      await lan.init();
-      await lan.connect({ host: legacyHost, port: legacyPort });
-
+    await enqueuePrint(async () => {
+      const tag = '[DEMO][NET-KITCHEN]';
       try {
-        await renderReceipt(receiptJson as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-        await appendLog(`${tag} [default-route] printed to ${legacyHost}:${legacyPort}`);
-      } catch (e) {
-        await appendLog(`${tag} [default-route] first try failed, retrying once: ${errMsg(e)}`);
+        setBusy(true);
+
+        // Build a kitchen-only view of the JSON so only kitchen routes print
+        const allBlocks = (receiptJson as any)?.data || [];
+        const kitchenBlocks = allBlocks.filter((b: any) => b?.type === 'kitchen_print');
+        if (!kitchenBlocks.length) {
+          Alert.alert('Kitchen Print', 'No kitchen_print block found in receipt JSON.');
+          return;
+        }
+        const kitchenOnlyJson = { ...(receiptJson as any), data: kitchenBlocks };
+
+        if (enableMultiNet && savedPrinters.length > 0) {
+          await appendLog(`${tag} attempting saved-printer routing for kitchen-only JSON`);
+          const res = await handleMultiLanPrint(kitchenOnlyJson, tag);
+          if (res.handled) {
+            if (res.matched) {
+              await appendLog(`${tag} printed to matched kitchen target(s)`);
+              setLanConnected(true);
+            } else {
+              await appendLog(`${tag} no saved printer matched -> fallback to legacy single-LAN kitchen print`);
+              // fall through to legacy
+            }
+          } else {
+            await appendLog(`${tag} kitchen-only JSON had no ip targets -> legacy single-LAN kitchen print`);
+            // fall through to legacy
+          }
+        }
+
+        // Legacy single-host kitchen print (connected IP)
+        const legacyHost = host.trim();
+        const legacyPort = Number(port) || 9100;
+        if (!legacyHost) {
+          await appendLog(`${tag} legacy fallback aborted: no IP set`);
+          Alert.alert('Network', 'No legacy IP set to print kitchen receipt.');
+          return;
+        }
+
+        await appendLog(`${tag} [legacy] connect ${legacyHost}:${legacyPort}`);
         await lan.init();
         await lan.connect({ host: legacyHost, port: legacyPort });
-        await renderReceipt(receiptJson as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-        await appendLog(`${tag} [default-route] printed (retry) to ${legacyHost}:${legacyPort}`);
+
+        // Print all kitchen blocks; respect individual_print
+        for (const kb of kitchenBlocks) {
+          const individual = String(kb?.individual_print ?? '0') === '1';
+          if (individual) {
+            const items = kb?.data?.itemdata || [];
+            for (const it of items) {
+              const payload = buildSingleKitchenItemPayload(receiptJson as any, kb, it);
+              await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+              await sleep(120);
+            }
+          } else {
+            const payload = buildKitchenPayload(receiptJson as any, kb);
+            await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+          }
+        }
+
+        setLanConnected(true);
+      } catch (e) {
+        await appendLog(`${tag} ERROR: ${errMsg(e)}`);
+        Alert.alert('Print', errMsg(e) || 'Failed to print kitchen receipt over network.');
+      } finally {
+        setBusy(false);
       }
-      setLanConnected(true);
-    } catch (e) {
-      await appendLog(`${tag} ERROR: ${errMsg(e)}`);
-      Alert.alert('Print', errMsg(e) || 'Failed to print receipt over network.');
-    } finally {
-      setBusy(false);
-    }
+    });
   };
 
   // ---------- Boot ----------
@@ -539,7 +608,6 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
     };
     boot();
     return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ---------- AppState refresh ----------
@@ -573,75 +641,170 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
       }
     });
     return () => sub.remove();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bleConnected, lanConnected]);
 
   // ---------- PRINT_JSON router ----------
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener('PRINT_JSON', async (json) => {
-      const tag = '[EVENT]';
-      try {
-        if (enableMultiNet && savedPrinters.length > 0) {
-          await appendLog(`${tag} attempting saved-printer routing using ip_address in JSON`);
-          const res = await handleMultiLanPrint(json, tag);
-          if (res.handled) {
-            if (res.matched) {
-              await appendLog(`${tag} saved-printer routing: printed to matched target(s)`);
+      await enqueuePrint(async () => {
+        const tag = '[EVENT]';
+        try {
+          // ----------------- STRICT WEBVIEW ROUTER (ADDED) -----------------
+          // Split payload once for strict routing
+          const allBlocks = ((json as any)?.data || []) as any[];
+          const cashierPayload = { ...(json as any), data: allBlocks.filter(b => String(b?.type).toLowerCase() !== 'kitchen_print') };
+          const kitchenOnlyJson = { ...(json as any), data: allBlocks.filter(b => String(b?.type).toLowerCase() === 'kitchen_print') };
+
+          let didSomething = false;
+
+          // CASHIER -> BLE ONLY
+          if (bleConnected && bleDevice?.mac && cashierPayload.data.length) {
+            if (!(await ensureBtPerms())) {
+              Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
             } else {
-              await appendLog(`${tag} saved-printer routing: no match -> blocking fallback (no print)`);
+              try { await ble.disconnect?.(); } catch {}
+              const session = new BLEPrinterService();
+              await session.init();
+              await session.connect(bleDevice.mac);
+              try {
+                await renderReceipt(cashierPayload as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+
+                try { await session.cut?.('full'); } catch {}
+              } catch {
+                try { await session.disconnect?.(); } catch {}
+                const session2 = new BLEPrinterService();
+                await session2.init();
+                await session2.connect(bleDevice.mac);
+                await renderReceipt(cashierPayload as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+                try { await session2.cut?.('full'); } catch {}
+                try { await session2.disconnect?.(); } catch {}
+              }
+              await sleep(150);
+              try { await session.disconnect?.(); } catch {}
+              setBleConnected(true);
+              didSomething = true;
             }
-            return;
           }
-          await appendLog(`${tag} no ip_address targeting in JSON -> considering fallback`);
-        }
 
-        if (activeTransport === 'ble' && bleDevice?.mac) {
-          if (!(await ensureBtPerms())) {
-            Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
-            return;
+          // KITCHEN -> LAN ONLY (Multi-Network first; otherwise legacy LAN kitchen-only)
+          if (kitchenOnlyJson.data.length) {
+            if (enableMultiNet && savedPrinters.length > 0) {
+              await appendLog(`${tag} strict: multi-LAN routing for kitchen only`);
+              const res = await handleMultiLanPrint(kitchenOnlyJson, tag); // IMPORTANT: pass kitchen-only
+              // STRICT: do NOT fall back to full JSON on LAN
+              if (res.matched) didSomething = true;
+            } else if (lanConnected && host) {
+              const p = Number(port) || 9100;
+              await appendLog(`${tag} strict: legacy LAN kitchen-only to ${host}:${p}`);
+              await lan.init();
+              await lan.connect({ host, port: p });
+              try {
+                for (const kb of kitchenOnlyJson.data) {
+                  const individual = String(kb?.individual_print ?? '0') === '1';
+                  if (individual) {
+                    const items = kb?.data?.itemdata || [];
+                    for (const it of items) {
+                      const payload = buildSingleKitchenItemPayload(json as any, kb, it);
+                      await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+                      await sleep(120);
+                    }
+                  } else {
+                    const payload = buildKitchenPayload(json as any, kb);
+                    await renderReceipt(payload, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+                  }
+                }
+                setLanConnected(true);
+                didSomething = true;
+              } finally {
+                try { await lan.disconnect?.(); } catch {}
+              }
+            }
           }
-          try { await ble.disconnect?.(); } catch {}
-          const session = new BLEPrinterService();
-          await session.init();
-          await session.connect(bleDevice.mac);
-          try {
-            await renderReceipt(json as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-          } catch {
+
+          if (!didSomething) {
+            await appendLog(`${tag} strict: nothing printed (need BLE for cashier and/or Multi-Network IP match for kitchen)`);
+            Alert.alert('No eligible printer', 'Connect BLE for cashier and/or configure Multi-Network IP matches for kitchen.');
+          }
+          // ----------------- STRICT WEBVIEW ROUTER (ADDED END) -----------------
+
+
+          // ----------------- ORIGINAL LOGIC (COMMENTED OUT) -----------------
+          /*
+          if (enableMultiNet && savedPrinters.length > 0) {
+            await appendLog(`${tag} attempting saved-printer routing using ip_address in JSON`);
+            const res = await handleMultiLanPrint(json, tag);
+            if (res.handled) {
+              if (res.matched) {
+                await appendLog(`${tag} saved-printer routing: printed to matched target(s)`);
+              } else {
+                await appendLog(`${tag} saved-printer routing: no match -> blocking fallback (no print)`);
+              }
+              return;
+            }
+            await appendLog(`${tag} no ip_address targeting in JSON -> considering fallback`);
+          }
+
+          if (activeTransport === 'ble' && bleDevice?.mac) {
+            if (!(await ensureBtPerms())) {
+              Alert.alert('Bluetooth', 'Bluetooth permissions are required.');
+              return;
+            }
+            try { await ble.disconnect?.(); } catch {}
+            const session = new BLEPrinterService();
+            await session.init();
+            await session.connect(bleDevice.mac);
+
+            const payload = {
+              ...(json as any),
+              data: ((json as any)?.data || []).filter(
+                (b: any) => String(b?.type).toLowerCase() !== 'kitchen_print'
+              ),
+            };
+
+            try {
+              await renderReceipt(payload as any, session, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+            } catch {
+              try { await session.disconnect?.(); } catch {}
+              const session2 = new BLEPrinterService();
+              await session2.init();
+              await session2.connect(bleDevice.mac);
+              await renderReceipt(payload as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+              try { await session2.disconnect?.(); } catch {}
+            }
+            await sleep(150);
             try { await session.disconnect?.(); } catch {}
-            const session2 = new BLEPrinterService();
-            await session2.init();
-            await session2.connect(bleDevice.mac);
-            await renderReceipt(json as any, session2, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-            try { await session2.disconnect?.(); } catch {}
+            setBleConnected(true);
+            return;
           }
-          await sleep(150);
-          try { await session.disconnect?.(); } catch {}
-          setBleConnected(true);
-          return;
-        }
 
-        if (activeTransport === 'lan' && host) {
-          const p = Number(port) || 9100;
-          await appendLog(`${tag} [default-route] event fallback to ${host}:${p}`);
-          await lan.init();
-          await lan.connect({ host, port: p });
-          try {
-            await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
-          } catch {
+          // ❌ This is the fallback that printed FULL JSON to LAN.
+          //    It has been replaced by the STRICT router above.
+          if (activeTransport === 'lan' && host) {
+            const p = Number(port) || 9100;
+            await appendLog(`${tag} [default-route] event fallback to ${host}:${p}`);
             await lan.init();
             await lan.connect({ host, port: p });
-            await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+            try {
+              await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+            } catch {
+              await lan.init();
+              await lan.connect({ host, port: p });
+              await renderReceipt(json as any, lan, { widthDots: WIDTH_DOTS, logoScale: LOGO_SCALE });
+            }
+            setLanConnected(true);
+            return;
           }
-          setLanConnected(true);
-          return;
-        }
 
-        await appendLog(`${tag} no transport connected — alerting user`);
-        Alert.alert('No printer connected', 'Connect Bluetooth or Network printer first.');
-      } catch (err) {
-        await appendLog(`${tag} ERROR: ${errMsg(err)}`);
-        Alert.alert('Print error', errMsg(err));
-      }
+          await appendLog(`${tag} no transport connected — alerting user`);
+          Alert.alert('No printer connected', 'Connect Bluetooth or Network printer first.');
+          */
+          // ----------------- ORIGINAL LOGIC (COMMENTED OUT END) -----------------
+
+        } catch (err) {
+          await appendLog(`${tag} ERROR: ${errMsg(err)}`);
+          Alert.alert('Print error', errMsg(err));
+        }
+      });
     });
     return () => sub.remove?.();
   }, [activeTransport, bleConnected, lanConnected, host, port, bleDevice?.mac, enableMultiNet, savedPrinters]);
@@ -945,7 +1108,7 @@ export default function DrawerContent(_props: DrawerContentComponentProps) {
               placeholderTextColor="#9CA3AF"
             />
 
-            <Text style={styles.label}>Port</Text>
+          <Text style={styles.label}>Port</Text>
             <TextInput
               placeholder="9100"
               value={editPort}
